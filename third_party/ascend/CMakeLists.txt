@@ -27,6 +27,8 @@ add_triton_plugin(TritonAscend
 
   LINK_LIBS
   TritonToLinalg
+  TritonAscendProtonDialect
+  TritonAscendProtonTransforms
   BiShengIRScopeDialect
   BiShengIRHIVMDialect
 )

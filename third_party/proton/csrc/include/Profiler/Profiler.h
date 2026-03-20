@@ -12,6 +12,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <vector>
 
 namespace proton {
 
@@ -26,29 +27,30 @@ public:
   /// Start the profiler.
   /// If the profiler is already started, this function does nothing.
   Profiler *start() {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    if (this->isInitialized)
-      return this;
-    this->doStart();
-    this->isInitialized = true;
+    if (!this->started) {
+      this->started = true;
+      this->doStart();
+    }
     return this;
   }
 
   /// Flush the profiler's data from the device to the host.
   /// It doesn't stop the profiler.
   Profiler *flush() {
-    std::unique_lock<std::shared_mutex> lock(mutex);
     this->doFlush();
     return this;
   }
 
   /// Stop the profiler.
+  /// Do real stop if there's no data to collect.
   Profiler *stop() {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    if (!this->isInitialized)
+    if (!this->started) {
       return this;
-    this->doStop();
-    this->isInitialized = false;
+    }
+    if (this->getDataSet().empty()) {
+      this->started = false;
+      this->doStop();
+    }
     return this;
   }
 
@@ -73,14 +75,32 @@ public:
     return dataSet;
   }
 
+  Profiler *setMode(const std::vector<std::string> &modeAndOptions) {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    this->modeAndOptions = modeAndOptions;
+    this->doSetMode(modeAndOptions);
+    return this;
+  }
+
+  std::vector<std::string> getMode() const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    return modeAndOptions;
+  }
+
 protected:
   virtual void doStart() = 0;
   virtual void doFlush() = 0;
   virtual void doStop() = 0;
+  virtual void doSetMode(const std::vector<std::string> &modeAndOptions) = 0;
 
+  // `dataSet` can be accessed by both the user thread and the background
+  // threads
   mutable std::shared_mutex mutex;
   std::set<Data *> dataSet;
-  bool isInitialized{false};
+
+private:
+  bool started{};
+  std::vector<std::string> modeAndOptions{};
 };
 
 } // namespace proton

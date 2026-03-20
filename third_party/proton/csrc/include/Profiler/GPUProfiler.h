@@ -3,6 +3,7 @@
 
 #include "Context/Context.h"
 #include "Profiler.h"
+#include "Session/Session.h"
 #include "Utility/Atomic.h"
 #include "Utility/Map.h"
 #include "Utility/Set.h"
@@ -19,7 +20,7 @@ namespace proton {
 // CuptiProfiler, should be a singleton.
 template <typename ConcreteProfilerT>
 class GPUProfiler : public Profiler,
-                    public ThreadLocalOpInterface,
+                    public OpInterface,
                     public Singleton<ConcreteProfilerT> {
 public:
   GPUProfiler() = default;
@@ -31,20 +32,17 @@ public:
                     std::unordered_map<uint64_t, std::pair<size_t, size_t>>>;
   using ApiExternIdSet = ThreadSafeSet<size_t, std::unordered_set<size_t>>;
 
-  ConcreteProfilerT &enablePCSampling() {
-    pcSamplingEnabled = true;
+  ConcreteProfilerT &setLibPath(const std::string &libPath) {
+    pImpl->setLibPath(libPath);
     return dynamic_cast<ConcreteProfilerT &>(*this);
   }
-  ConcreteProfilerT &disablePCSampling() {
-    pcSamplingEnabled = false;
-    return dynamic_cast<ConcreteProfilerT &>(*this);
-  }
-  bool isPCSamplingEnabled() const { return pcSamplingEnabled; }
 
 protected:
   // OpInterface
   void startOp(const Scope &scope) override {
     this->correlation.pushExternId(scope.scopeId);
+    for (auto data : getDataSet())
+      data->addOp(scope.scopeId, scope.name);
   }
   void stopOp(const Scope &scope) override { this->correlation.popExternId(); }
 
@@ -55,30 +53,38 @@ protected:
 
   struct ThreadState {
     ConcreteProfilerT &profiler;
+    SessionManager &sessionManager = SessionManager::instance();
+    std::vector<Scope> scopeStack;
+    size_t opId{Scope::DummyScopeId};
 
     ThreadState(ConcreteProfilerT &profiler) : profiler(profiler) {}
 
-    void record(size_t scopeId) {
+    void enterOp() {
       if (profiler.isOpInProgress())
         return;
-      std::set<Data *> dataSet = profiler.getDataSet();
-      for (auto data : dataSet)
-        data->addScope(scopeId);
-      profiler.correlation.apiExternIds.insert(scopeId);
-    }
-
-    void enterOp(size_t scopeId) {
-      if (profiler.isOpInProgress())
-        return;
-      profiler.correlation.pushExternId(scopeId);
-      profiler.setOpInProgress(true);
+      opId = Scope::getNewScopeId();
+      profiler.enterOp(Scope(opId));
+      profiler.correlation.apiExternIds.insert(opId);
     }
 
     void exitOp() {
       if (!profiler.isOpInProgress())
         return;
-      profiler.correlation.popExternId();
-      profiler.setOpInProgress(false);
+      profiler.exitOp(Scope(opId));
+    }
+
+    void enterScope(const std::string &name) {
+      auto scope = Scope(name);
+      scopeStack.push_back(scope);
+      sessionManager.enterScope(scope);
+    }
+
+    void exitScope() {
+      if (scopeStack.empty()) {
+        return;
+      }
+      sessionManager.exitScope(scopeStack.back());
+      scopeStack.pop_back();
     }
   };
 
@@ -142,6 +148,7 @@ protected:
         : profiler(profiler) {}
     virtual ~GPUProfilerPimplInterface() = default;
 
+    virtual void setLibPath(const std::string &libPath) = 0;
     virtual void doStart() = 0;
     virtual void doFlush() = 0;
     virtual void doStop() = 0;

@@ -1,22 +1,43 @@
 #ifndef PROTON_DATA_METRIC_H_
 #define PROTON_DATA_METRIC_H_
 
+#include "Utility/String.h"
 #include "Utility/Traits.h"
+#include <stdexcept>
 #include <variant>
 #include <vector>
 
 namespace proton {
 
-enum class MetricKind { Flexible, Kernel, PCSampling, Count };
+enum class MetricKind { Flexible, Kernel, PCSampling, Cycle, Count };
 
 using MetricValueType = std::variant<uint64_t, int64_t, double, std::string>;
+
+inline const char *typeNameForIndex(std::size_t idx) {
+  switch (idx) {
+  case 0:
+    return "uint64_t";
+  case 1:
+    return "int64_t";
+  case 2:
+    return "double";
+  case 3:
+    return "std::string";
+  default:
+    return "<unknown>";
+  }
+}
 
 /// A metric is a class that can be associated with a context.
 /// `Metric` is the base class for all metrics.
 /// Each `Metric` has a name and a set of values.
 /// Each value could be of type `uint64_t`, `int64_t`, or `double`,
-/// Each value also has its own name and is either aggregable or not.
-/// Currently the only aggregation operation is `addition`.
+/// Each value can be inclusive (inc), exclusive (exc), or a property (pty).
+/// Inclusive values are aggregated by addition and can be propagated to the
+/// parent.
+/// Exclusive values can be aggregated at a context but cannot be
+/// propagated to the parent.
+/// Property values are not aggregated and cannot be propagated to the parent.
 class Metric {
 public:
   Metric(MetricKind kind, size_t size) : kind(kind), values(size) {}
@@ -27,7 +48,9 @@ public:
 
   virtual const std::string getValueName(int valueId) const = 0;
 
-  virtual bool isAggregable(int valueId) const = 0;
+  virtual bool isProperty(int valueId) const = 0;
+
+  virtual bool isExclusive(int valueId) const = 0;
 
   std::vector<MetricValueType> getValues() const { return values; }
 
@@ -35,6 +58,14 @@ public:
 
   /// Update a specific value id with the new value.
   void updateValue(int valueId, MetricValueType value) {
+    // Enforce type consistency: once a valueId has a type, it must not change.
+    if (values[valueId].index() != value.index()) {
+      throw std::runtime_error(
+          std::string("Metric value type mismatch for valueId ") +
+          std::to_string(valueId) + " (" + getValueName(valueId) + ")" +
+          ": current=" + typeNameForIndex(values[valueId].index()) +
+          ", new=" + typeNameForIndex(value.index()));
+    }
     // Handle string and other values separately
     if (std::holds_alternative<std::string>(value)) {
       values[valueId] = std::get<std::string>(value);
@@ -44,10 +75,10 @@ public:
             using CurrentType = std::decay_t<decltype(currentValue)>;
             using ValueType = std::decay_t<decltype(otherValue)>;
             if constexpr (std::is_same_v<ValueType, CurrentType>) {
-              if (isAggregable(valueId)) {
-                currentValue += otherValue;
-              } else {
+              if (isProperty(valueId)) {
                 currentValue = otherValue;
+              } else {
+                currentValue += otherValue;
               }
             }
           },
@@ -81,15 +112,23 @@ protected:
 
 /// A flexible metric is provided by users but not the backend profiling API.
 /// Each flexible metric has a single value.
-/// When aggregable = true, the value can be aggregated over time.
-/// When aggregable = false, the value is a property that doesn't change over
-/// time.
 class FlexibleMetric : public Metric {
 public:
   FlexibleMetric(const std::string &valueName,
-                 std::variant<MetricValueType> value, bool aggregable)
-      : valueName(valueName), Metric(MetricKind::Flexible, 1),
-        aggregable(aggregable) {
+                 std::variant<MetricValueType> value)
+      : Metric(MetricKind::Flexible, 1), valueName(valueName) {
+    this->exclusive = endWith(valueName, "(exc)");
+    this->property = endWith(valueName, "(pty)");
+    this->valueName = trim(replace(this->valueName, "(exc)", ""));
+    this->valueName = trim(replace(this->valueName, "(pty)", ""));
+    std::visit([&](auto &&v) { this->values[0] = v; }, value);
+  }
+
+  FlexibleMetric(const std::string &valueName,
+                 std::variant<MetricValueType> value, bool property,
+                 bool exclusive)
+      : Metric(MetricKind::Flexible, 1), valueName(valueName),
+        property(property), exclusive(exclusive) {
     std::visit([&](auto &&v) { this->values[0] = v; }, value);
   }
 
@@ -99,11 +138,14 @@ public:
     return valueName;
   }
 
-  bool isAggregable(int valueId) const override { return aggregable; }
+  bool isProperty(int valueId) const override { return property; }
+
+  bool isExclusive(int valueId) const override { return exclusive; }
 
 private:
-  const bool aggregable;
-  const std::string valueName;
+  bool property{};
+  bool exclusive{};
+  std::string valueName;
 };
 
 class KernelMetric : public Metric {
@@ -115,13 +157,14 @@ public:
     Duration,
     DeviceId,
     DeviceType,
+    StreamId,
     Count,
   };
 
   KernelMetric() : Metric(MetricKind::Kernel, kernelMetricKind::Count) {}
 
   KernelMetric(uint64_t startTime, uint64_t endTime, uint64_t invocations,
-               uint64_t deviceId, uint64_t deviceType)
+               uint64_t deviceId, uint64_t deviceType, uint64_t streamId)
       : KernelMetric() {
     this->values[StartTime] = startTime;
     this->values[EndTime] = endTime;
@@ -129,6 +172,7 @@ public:
     this->values[Duration] = endTime - startTime;
     this->values[DeviceId] = deviceId;
     this->values[DeviceType] = deviceType;
+    this->values[StreamId] = streamId;
   }
 
   virtual const std::string getName() const { return "KernelMetric"; }
@@ -137,14 +181,18 @@ public:
     return VALUE_NAMES[valueId];
   }
 
-  virtual bool isAggregable(int valueId) const { return AGGREGABLE[valueId]; }
+  virtual bool isProperty(int valueId) const { return PROPERTY[valueId]; }
+
+  virtual bool isExclusive(int valueId) const { return EXCLUSIVE[valueId]; }
 
 private:
-  const static inline bool AGGREGABLE[kernelMetricKind::Count] = {
-      false, false, true, true, false, false};
+  const static inline bool PROPERTY[kernelMetricKind::Count] = {
+      true, true, false, false, true, true, true};
+  const static inline bool EXCLUSIVE[kernelMetricKind::Count] = {
+      false, false, false, false, true, true, true};
   const static inline std::string VALUE_NAMES[kernelMetricKind::Count] = {
-      "start_time (ns)", "end_time (ns)", "count",
-      "time (ns)",       "device_id",     "device_type",
+      "start_time (ns)", "end_time (ns)", "count",     "time (ns)",
+      "device_id",       "device_type",   "stream_id",
   };
 };
 
@@ -191,7 +239,9 @@ public:
     return VALUE_NAMES[valueId];
   }
 
-  virtual bool isAggregable(int valueId) const { return true; }
+  virtual bool isProperty(int valueId) const { return false; }
+
+  virtual bool isExclusive(int valueId) const { return false; }
 
 private:
   const static inline std::string VALUE_NAMES[PCSamplingMetricKind::Count] = {
@@ -216,6 +266,77 @@ private:
       "stalled_sleeping",
       "stalled_selected",
   };
+};
+
+class CycleMetric : public Metric {
+public:
+  enum CycleMetricKind : int {
+    StartCycle,
+    EndCycle,
+    Duration,
+    NormalizedDuration,
+    KernelId,
+    KernelName,
+    BlockId,
+    ProcessorId,
+    UnitId,
+    DeviceId,
+    DeviceType,
+    TimeShiftCost,
+    InitTime,
+    PreFinalTime,
+    PostFinalTime,
+    Count,
+  };
+
+  CycleMetric() : Metric(MetricKind::Cycle, CycleMetricKind::Count) {}
+
+  CycleMetric(uint64_t startCycle, uint64_t endCycle, uint64_t duration,
+              double normalizedDuration, uint64_t kernelId,
+              const std::string &kernelName, uint64_t blockId,
+              uint64_t processorId, uint64_t unitId, uint64_t deviceId,
+              uint64_t deviceType, uint64_t timeShiftCost, uint64_t initTime,
+              uint64_t preFinalTime, uint64_t postFinalTime)
+      : CycleMetric() {
+    this->values[StartCycle] = startCycle;
+    this->values[EndCycle] = endCycle;
+    this->values[Duration] = duration;
+    this->values[NormalizedDuration] = normalizedDuration;
+    this->values[KernelId] = kernelId;
+    this->values[KernelName] = kernelName;
+    this->values[BlockId] = blockId;
+    this->values[ProcessorId] = processorId;
+    this->values[UnitId] = unitId;
+    this->values[DeviceId] = deviceId;
+    this->values[DeviceType] = deviceType;
+    this->values[TimeShiftCost] = timeShiftCost;
+    this->values[InitTime] = initTime;
+    this->values[PreFinalTime] = preFinalTime;
+    this->values[PostFinalTime] = postFinalTime;
+  }
+
+  virtual const std::string getName() const { return "CycleMetric"; }
+
+  virtual const std::string getValueName(int valueId) const {
+    return VALUE_NAMES[valueId];
+  }
+
+  virtual bool isProperty(int valueId) const { return PROPERTY[valueId]; }
+
+  virtual bool isExclusive(int valueId) const { return EXCLUSIVE[valueId]; }
+
+private:
+  const static inline bool PROPERTY[CycleMetricKind::Count] = {
+      false, false, false, false, true,  true,  true, true,
+      true,  true,  true,  true,  false, false, false};
+  const static inline bool EXCLUSIVE[CycleMetricKind::Count] = {
+      false, false, true, true, true,  true,  true, true,
+      true,  true,  true, true, false, false, false};
+  const static inline std::string VALUE_NAMES[CycleMetricKind::Count] = {
+      "start_cycle", "end_cycle",      "cycles",         "normalized_cycles",
+      "kernel_id",   "kernel_name",    "block_id",       "processor_id",
+      "unit_id",     "device_id",      "device_type",    "time_shift_cost",
+      "init_time",   "pre_final_time", "post_final_time"};
 };
 
 } // namespace proton

@@ -417,6 +417,21 @@ class CMakeBuild(build_ext):
         if roctracer_include_dir == "":
             roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
         cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
+
+        ascend_include_dir = get_env_with_keys(["ASCEND_INCLUDE_DIR"])
+        if ascend_include_dir == "":
+            ascend_home = get_env_with_keys(["ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"])
+            if ascend_home != "":
+                candidates = [
+                    os.path.join(ascend_home, "include"),
+                    os.path.join(ascend_home, "runtime", "include"),
+                ]
+                for candidate in candidates:
+                    if os.path.exists(os.path.join(candidate, "acl", "acl.h")):
+                        ascend_include_dir = candidate
+                        break
+        if ascend_include_dir != "":
+            cmake_args += ["-DASCEND_INCLUDE_DIR=" + ascend_include_dir]
         return cmake_args
 
     def build_extension(self, ext):
@@ -512,6 +527,12 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=cmake_dir)
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
+        if check_env_flag("TRITON_BUILD_PROTON", "ON"):
+            libproton_build = os.path.join(extdir, "libproton.so")
+            if os.path.exists(libproton_build):
+                source_c_dir = os.path.join(get_base_dir(), "python", "triton", "_C")
+                os.makedirs(source_c_dir, exist_ok=True)
+                shutil.copy2(libproton_build, os.path.join(source_c_dir, "libproton.so"))
 
 nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
 with open(nvidia_version_path, "r") as nvidia_version_file:

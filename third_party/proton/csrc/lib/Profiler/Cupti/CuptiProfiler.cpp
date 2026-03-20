@@ -1,11 +1,14 @@
 #include "Profiler/Cupti/CuptiProfiler.h"
 #include "Context/Context.h"
 #include "Data/Metric.h"
-#include "Driver/Device.h"
+#include "Device.h"
 #include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
+#include "Driver/GPU/NvtxApi.h"
 #include "Profiler/Cupti/CuptiPCSampling.h"
+#include "Utility/Env.h"
 #include "Utility/Map.h"
+#include "Utility/String.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -35,7 +38,8 @@ std::shared_ptr<Metric> convertActivityToMetric(CUpti_Activity *activity) {
           static_cast<uint64_t>(kernel->start),
           static_cast<uint64_t>(kernel->end), 1,
           static_cast<uint64_t>(kernel->deviceId),
-          static_cast<uint64_t>(DeviceType::CUDA));
+          static_cast<uint64_t>(DeviceType::CUDA),
+          static_cast<uint64_t>(kernel->streamId));
     } // else: not a valid kernel activity
     break;
   }
@@ -61,7 +65,7 @@ processActivityKernel(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
       auto scopeId = parentId;
       if (apiExternIds.contain(scopeId)) {
         // It's triggered by a CUDA op but not triton op
-        scopeId = data->addScope(parentId, kernel->name);
+        scopeId = data->addOp(parentId, kernel->name);
       }
       data->addMetric(scopeId, convertActivityToMetric(activity));
     }
@@ -75,7 +79,7 @@ processActivityKernel(CuptiProfiler::CorrIdToExternIdMap &corrIdToExternId,
     // --- CUPTI thread ---
     // 3. corrId -> numKernels
     for (auto *data : dataSet) {
-      auto externId = data->addScope(parentId, kernel->name);
+      auto externId = data->addOp(parentId, kernel->name);
       data->addMetric(externId, convertActivityToMetric(activity));
     }
   }
@@ -175,6 +179,15 @@ void setResourceCallbacks(CUpti_SubscriberHandle subscriber, bool enable) {
 #undef CALLBACK_ENABLE
 }
 
+void setNvtxCallbacks(CUpti_SubscriberHandle subscriber, bool enable) {
+#define CALLBACK_ENABLE(id)                                                    \
+  cupti::enableCallback<true>(static_cast<uint32_t>(enable), subscriber,       \
+                              CUPTI_CB_DOMAIN_NVTX, id)
+  CALLBACK_ENABLE(CUPTI_CBID_NVTX_nvtxRangePushA);
+  CALLBACK_ENABLE(CUPTI_CBID_NVTX_nvtxRangePop);
+#undef CALLBACK_ENABLE
+}
+
 bool isDriverAPILaunch(CUpti_CallbackId cbId) {
   return cbId == CUPTI_DRIVER_TRACE_CBID_cuLaunch ||
          cbId == CUPTI_DRIVER_TRACE_CBID_cuLaunchGrid ||
@@ -198,6 +211,9 @@ struct CuptiProfiler::CuptiProfilerPimpl
       : GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface(profiler) {}
   virtual ~CuptiProfilerPimpl() = default;
 
+  void setLibPath(const std::string &libPath) override {
+    cupti::setLibPath(libPath);
+  }
   void doStart() override;
   void doFlush() override;
   void doStop() override;
@@ -227,7 +243,7 @@ void CuptiProfiler::CuptiProfilerPimpl::allocBuffer(uint8_t **buffer,
                                                     size_t *maxNumRecords) {
   *buffer = static_cast<uint8_t *>(aligned_alloc(AlignSize, BufferSize));
   if (*buffer == nullptr) {
-    throw std::runtime_error("aligned_alloc failed");
+    throw std::runtime_error("[PROTON] aligned_alloc failed");
   }
   *bufferSize = BufferSize;
   *maxNumRecords = 0;
@@ -239,7 +255,7 @@ void CuptiProfiler::CuptiProfilerPimpl::completeBuffer(CUcontext ctx,
                                                        size_t size,
                                                        size_t validSize) {
   CuptiProfiler &profiler = threadState.profiler;
-  auto &dataSet = profiler.dataSet;
+  auto dataSet = profiler.getDataSet();
   uint32_t maxCorrelationId = 0;
   CUptiResult status;
   CUpti_Activity *activity = nullptr;
@@ -253,7 +269,7 @@ void CuptiProfiler::CuptiProfilerPimpl::completeBuffer(CUcontext ctx,
     } else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED) {
       break;
     } else {
-      throw std::runtime_error("cupti::activityGetNextRecord failed");
+      throw std::runtime_error("[PROTON] cupti::activityGetNextRecord failed");
     }
   } while (true);
 
@@ -274,23 +290,23 @@ void CuptiProfiler::CuptiProfilerPimpl::callbackFn(void *userData,
     if (cbId == CUPTI_CBID_RESOURCE_MODULE_LOADED) {
       auto *moduleResource = static_cast<CUpti_ModuleResourceData *>(
           resourceData->resourceDescriptor);
-      if (profiler.isPCSamplingEnabled()) {
+      if (profiler.pcSamplingEnabled) {
         pImpl->pcSampling.loadModule(moduleResource->pCubin,
                                      moduleResource->cubinSize);
       }
     } else if (cbId == CUPTI_CBID_RESOURCE_MODULE_UNLOAD_STARTING) {
       auto *moduleResource = static_cast<CUpti_ModuleResourceData *>(
           resourceData->resourceDescriptor);
-      if (profiler.isPCSamplingEnabled()) {
+      if (profiler.pcSamplingEnabled) {
         pImpl->pcSampling.unloadModule(moduleResource->pCubin,
                                        moduleResource->cubinSize);
       }
     } else if (cbId == CUPTI_CBID_RESOURCE_CONTEXT_CREATED) {
-      if (profiler.isPCSamplingEnabled()) {
+      if (profiler.pcSamplingEnabled) {
         pImpl->pcSampling.initialize(resourceData->context);
       }
     } else if (cbId == CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING) {
-      if (profiler.isPCSamplingEnabled()) {
+      if (profiler.pcSamplingEnabled) {
         pImpl->pcSampling.finalize(resourceData->context);
       }
     } else {
@@ -318,14 +334,20 @@ void CuptiProfiler::CuptiProfilerPimpl::callbackFn(void *userData,
         pImpl->graphIdToNumInstances.erase(graphId);
       }
     }
+  } else if (domain == CUPTI_CB_DOMAIN_NVTX) {
+    auto *nvtxData = static_cast<const CUpti_NvtxData *>(cbData);
+    if (cbId == CUPTI_CBID_NVTX_nvtxRangePushA) {
+      auto message = nvtx::getMessageFromRangePushA(nvtxData->functionParams);
+      threadState.enterScope(message);
+    } else if (cbId == CUPTI_CBID_NVTX_nvtxRangePop) {
+      threadState.exitScope();
+    } // TODO: else handle other NVTX range functions
   } else {
     const CUpti_CallbackData *callbackData =
         static_cast<const CUpti_CallbackData *>(cbData);
     auto *pImpl = dynamic_cast<CuptiProfilerPimpl *>(profiler.pImpl.get());
     if (callbackData->callbackSite == CUPTI_API_ENTER) {
-      auto scopeId = Scope::getNewScopeId();
-      threadState.record(scopeId);
-      threadState.enterOp(scopeId);
+      threadState.enterOp();
       size_t numInstances = 1;
       if (cbId == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch ||
           cbId == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz) {
@@ -351,11 +373,11 @@ void CuptiProfiler::CuptiProfilerPimpl::callbackFn(void *userData,
                     << std::endl;
       }
       profiler.correlation.correlate(callbackData->correlationId, numInstances);
-      if (profiler.isPCSamplingEnabled() && isDriverAPILaunch(cbId)) {
+      if (profiler.pcSamplingEnabled && isDriverAPILaunch(cbId)) {
         pImpl->pcSampling.start(callbackData->context);
       }
     } else if (callbackData->callbackSite == CUPTI_API_EXIT) {
-      if (profiler.isPCSamplingEnabled() && isDriverAPILaunch(cbId)) {
+      if (profiler.pcSamplingEnabled && isDriverAPILaunch(cbId)) {
         // XXX: Conservatively stop every GPU kernel for now
         auto scopeId = profiler.correlation.externIdQueue.back();
         pImpl->pcSampling.stop(
@@ -370,7 +392,7 @@ void CuptiProfiler::CuptiProfilerPimpl::callbackFn(void *userData,
 
 void CuptiProfiler::CuptiProfilerPimpl::doStart() {
   cupti::subscribe<true>(&subscriber, callbackFn, nullptr);
-  if (profiler.isPCSamplingEnabled()) {
+  if (profiler.pcSamplingEnabled) {
     setResourceCallbacks(subscriber, /*enable=*/true);
     // Continuous PC sampling is not compatible with concurrent kernel profiling
     cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_KERNEL);
@@ -381,6 +403,10 @@ void CuptiProfiler::CuptiProfilerPimpl::doStart() {
   setGraphCallbacks(subscriber, /*enable=*/true);
   setRuntimeCallbacks(subscriber, /*enable=*/true);
   setDriverCallbacks(subscriber, /*enable=*/true);
+  if (getBoolEnv("TRITON_ENABLE_NVTX", true)) {
+    nvtx::enable();
+    setNvtxCallbacks(subscriber, /*enable=*/true);
+  }
 }
 
 void CuptiProfiler::CuptiProfilerPimpl::doFlush() {
@@ -397,9 +423,6 @@ void CuptiProfiler::CuptiProfilerPimpl::doFlush() {
   if (cuContext) {
     cuda::ctxSynchronize<true>();
   }
-  if (profiler.isPCSamplingEnabled()) {
-    pcSampling.finalize(cuContext);
-  }
   profiler.correlation.flush(
       /*maxRetries=*/100, /*sleepMs=*/10,
       /*flush=*/[]() {
@@ -413,7 +436,12 @@ void CuptiProfiler::CuptiProfilerPimpl::doFlush() {
 }
 
 void CuptiProfiler::CuptiProfilerPimpl::doStop() {
-  if (profiler.isPCSamplingEnabled()) {
+  if (profiler.pcSamplingEnabled) {
+    profiler.pcSamplingEnabled = false;
+    CUcontext cuContext = nullptr;
+    cuda::ctxGetCurrent<false>(&cuContext);
+    if (cuContext)
+      pcSampling.finalize(cuContext);
     setResourceCallbacks(subscriber, /*enable=*/false);
     cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_KERNEL);
   } else {
@@ -422,6 +450,8 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
   setGraphCallbacks(subscriber, /*enable=*/false);
   setRuntimeCallbacks(subscriber, /*enable=*/false);
   setDriverCallbacks(subscriber, /*enable=*/false);
+  nvtx::disable();
+  setNvtxCallbacks(subscriber, /*enable=*/false);
   cupti::unsubscribe<true>(subscriber);
   cupti::finalize<true>();
 }
@@ -431,5 +461,15 @@ CuptiProfiler::CuptiProfiler() {
 }
 
 CuptiProfiler::~CuptiProfiler() = default;
+
+void CuptiProfiler::doSetMode(const std::vector<std::string> &modeAndOptions) {
+  auto mode = modeAndOptions[0];
+  if (proton::toLower(mode) == "pcsampling") {
+    pcSamplingEnabled = true;
+  } else if (!mode.empty()) {
+    throw std::invalid_argument("[PROTON] CuptiProfiler: unsupported mode: " +
+                                mode);
+  }
+}
 
 } // namespace proton

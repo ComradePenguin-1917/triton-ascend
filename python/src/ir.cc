@@ -29,6 +29,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "ascend/include/Dialect/TritonAscendProton/IR/TritonAscendProtonDialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/SourceMgr.h"
 
@@ -250,6 +251,7 @@ void init_triton_ir(py::module &&m) {
                     scf::SCFDialect, ::mlir::gpu::GPUDialect,
                     cf::ControlFlowDialect, LLVM::LLVMDialect,
                     mlir::ub::UBDialect>();
+    mlir::triton::proton::registerTritonAscendProtonDialect(registry);
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);
@@ -612,6 +614,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_module",
            [](TritonOpBuilder &self) -> ModuleOp {
              return self.create<ModuleOp>();
+           })
+      .def("get_op_builder_capsule",
+           [](TritonOpBuilder &self) -> py::capsule {
+             return py::capsule(&self.getBuilder(), "mlir::OpBuilder");
            })
       // insertion block/point
       .def("set_insertion_point_to_start",
