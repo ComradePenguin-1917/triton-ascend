@@ -22,6 +22,11 @@ namespace proton {
 std::unique_ptr<Pass> createTritonAscendProtonToHIVMPass();
 
 //===----------------------------------------------------------------------===//
+// Pass to lower ReadCycleCounterOp to GetSysCntOp (must run after CSE)
+//===----------------------------------------------------------------------===//
+std::unique_ptr<Pass> createTritonAscendProtonLowerCycleCounterPass();
+
+//===----------------------------------------------------------------------===//
 // Pass to remove Proton instrumentation ops
 //===----------------------------------------------------------------------===//
 std::unique_ptr<Pass> createRemoveTritonAscendProtonOpsPass();

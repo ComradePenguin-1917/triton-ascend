@@ -14,6 +14,7 @@
 #include "Profiler/Ascend/AscendProfiler.h"
 #endif
 #include "Utility/String.h"
+#include <iostream>
 
 namespace proton {
 
@@ -269,10 +270,10 @@ void SessionManager::enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
                                          uint8_t *buffer, size_t size) {
   std::lock_guard<std::mutex> lock(mutex);
   executeInterface(instrumentationInterfaceCounts,
-                   [&](auto *instrumentationInterface) {
-                     instrumentationInterface->enterInstrumentedOp(
-                         streamId, functionId, buffer, size);
-                   });
+                    [&](auto *instrumentationInterface) {
+                      instrumentationInterface->enterInstrumentedOp(
+                          streamId, functionId, buffer, size);
+                    });
 }
 
 void SessionManager::exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
@@ -293,6 +294,16 @@ void SessionManager::addMetrics(
   for (auto [sessionId, active] : sessionActive) {
     if (active) {
       sessions[sessionId]->data->addMetrics(scopeId, metrics);
+    }
+  }
+}
+
+void SessionManager::addMetric(size_t scopeId,
+                               std::shared_ptr<Metric> metric) {
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto [sessionId, active] : sessionActive) {
+    if (active) {
+      sessions[sessionId]->data->addMetric(scopeId, metric);
     }
   }
 }

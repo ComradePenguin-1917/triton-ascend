@@ -26,7 +26,9 @@ void TritonAscendProtonDialect::initialize() {
   addOperations<
       RecordOp,
       MetricOp,
-      BarrierOp
+      BarrierOp,
+      MultibufferOp,
+      ReadCycleCounterOp
       >();
 }
 

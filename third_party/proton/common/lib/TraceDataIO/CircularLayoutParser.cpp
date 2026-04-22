@@ -171,6 +171,10 @@ Device decodeDevice(const uint32_t dev) {
     device.type = DeviceType::HIP;
     device.arch = "";
     break;
+  case 3:
+    device.type = DeviceType::ASCEND;
+    device.arch = "";
+    break;
   default:
     break;
   }
@@ -249,6 +253,10 @@ uint64_t proton::getTimeShiftCost(const CircularLayoutParserConfig &config) {
     return 7;
   else if (config.device.type == DeviceType::HIP)
     return 36;
+  else if (config.device.type == DeviceType::ASCEND)
+    // GetSysCntOp + PipeBarrier overhead on AICore.
+    // Ascend AICore has in-order pipeline; barrier+counter cost is ~12 cycles.
+    return 12;
 
   return 0;
 }

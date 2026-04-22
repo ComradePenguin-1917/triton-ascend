@@ -4,6 +4,7 @@
 #include "Profiler/GPUProfiler.h"
 #include <string>
 #include <cstdint>
+#include <unordered_map>
 
 namespace proton {
 
@@ -27,8 +28,15 @@ protected:
   // Profiler interface - override pure virtual methods
   void doSetMode(const std::vector<std::string> &modeAndOptions) override;
 
+  // Override to add wall-clock timing for scopes as fallback
+  void startOp(const Scope &scope) override;
+  void stopOp(const Scope &scope) override;
+
 private:
   struct AscendProfilerPimpl;
+
+  // Per-scope wall-clock start times (fallback when RT callback unavailable)
+  std::unordered_map<size_t, uint64_t> scopeStartTimes_;
 
   friend class GPUProfiler<AscendProfiler>;
 };

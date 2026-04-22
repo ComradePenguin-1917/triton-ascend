@@ -144,4 +144,25 @@ def TritonAscendProton_MultibufferOp : TritonAscendProton_Op<"multibuffer", []> 
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Cycle Counter Read - Non-pure wrapper around GetSysCnt
+//===----------------------------------------------------------------------===//
+
+def TritonAscendProton_ReadCycleCounterOp
+    : TritonAscendProton_Op<"read_cycle_counter",
+      [MemoryEffects<[MemRead]>]> {
+  let summary = "Read Ascend AICore cycle counter";
+
+  let description = [{
+    Reads the AICore system counter (GetSysCnt). Unlike hivm.get_sys_cnt
+    which is marked Pure and gets eliminated by CSE, this op has a memory
+    read effect to prevent CSE from folding multiple calls into one.
+    Lowered to hivm.hir.get_sys_cnt in the ProtonToHIVM pass.
+  }];
+
+  let results = (outs I64:$result);
+
+  let assemblyFormat = "attr-dict `->` type($result)";
+}
+
 #endif // TRITON_ASCEND_PROTON_OPS

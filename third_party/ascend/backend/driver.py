@@ -25,6 +25,7 @@ import os.path
 import re
 import subprocess
 import sysconfig
+import json
 from typing import Optional
 import functools
 import hashlib
@@ -142,6 +143,44 @@ class NPULauncher(object):
             cache_manager = get_cache_manager(args[5]['hash'])
             print("[INFO]: skip running kernel")
             print(f"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}")
+        # Proton instrumentation: enter before launch
+        metadata = args[5]
+        proton_scratch_size = metadata.get('proton_scratch_size') or 0
+        proton_function_id = metadata.get('proton_function_id')
+        if proton_scratch_size > 0 and proton_function_id is not None:
+            try:
+                from triton._C.libproton import proton as libproton
+                proton_scope_names = metadata.get('proton_scope_names', '')
+                proton_metadata_path = metadata.get('proton_metadata_path', '')
+                if proton_scope_names:
+                    if isinstance(proton_scope_names, str):
+                        unique_scopes = proton_scope_names.split(':')
+                    elif isinstance(proton_scope_names, list):
+                        unique_scopes = proton_scope_names
+                    else:
+                        unique_scopes = []
+                    if unique_scopes:
+                        kernel_name = metadata.get('name', metadata.get('hash', 'unknown')).split()[0]
+                        scope_id_name_pairs = list(enumerate(unique_scopes))
+                        if not proton_metadata_path or not os.path.exists(proton_metadata_path):
+                            proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
+                            proton_metadata_path = os.path.join(proton_tmpdir, "proton_metadata.json")
+                            metadata_json = {
+                                "profile_scratch_size": proton_scratch_size,
+                                "num_warps": 1,
+                            }
+                            with open(proton_metadata_path, "w") as f:
+                                json.dump(metadata_json, f)
+                        libproton.init_function_metadata(
+                            proton_function_id, kernel_name, scope_id_name_pairs, [], proton_metadata_path
+                        )
+                proton_buf_ptr = metadata.get('_proton_buffer_ptr', 0)
+                proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
+                stream = args[3]
+                stream_id = stream if isinstance(stream, int) else 0
+                libproton.enter_instrumented_op(stream_id, proton_function_id, 0, proton_scratch_size)
+            except Exception:
+                pass
         if self.enable_msprof_register_tensor:
             tensor_params_shape = get_backend_func("get_tensor_params_shape", *args)
             # args[5] must be the packed metadata.
@@ -153,6 +192,17 @@ class NPULauncher(object):
             profiler_registered = self.launch(*args, **kwargs)
             import triton
             triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False
+        # Proton instrumentation: exit after launch
+        if proton_scratch_size > 0 and proton_function_id is not None:
+            try:
+                from triton._C.libproton import proton as libproton
+                proton_buf_ptr = metadata.get('_proton_buffer_ptr', 0)
+                proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
+                stream = args[3]
+                stream_id = stream if isinstance(stream, int) else 0
+                libproton.exit_instrumented_op(stream_id, proton_function_id, proton_buf_ptr, proton_buf_size)
+            except Exception:
+                pass
 
 class NPUDriver(DriverBase):
     def __init__(self):
@@ -426,6 +476,8 @@ def generate_npu_wrapper_src(constants, signature, metadata):
     compile_on_910_95 = metadata.compile_on_910_95
     parallel_mode = metadata.parallel_mode
     enable_simt = ("simt" in parallel_mode) or metadata.force_simt_only
+    proton_scratch_size = int(metadata.proton_scratch_size) \
+                               if hasattr(metadata, 'proton_scratch_size') and metadata.proton_scratch_size is not None else 0
 
     def _ty_to_cpp(ty):
         if ty[0] == '*':
@@ -536,6 +588,7 @@ def generate_npu_wrapper_src(constants, signature, metadata):
     alloc_success_code = 'return 1;'
     sync_lock_fail_code = 'fprintf(stderr, "Error: syncBlockLock allocation failed\\n"); return;'
     workspace_fail_code = 'fprintf(stderr, "Error: workspace allocation failed\\n"); return;'
+    proton_alloc_fail_code = 'fprintf(stderr, "Error: proton buffer allocation failed\\n");'
 
     cpp_device_pointer = """
 typedef struct _DevicePtrInfo {
@@ -774,19 +827,29 @@ extern "C" {
 
 {cpp_device_pointer}
 
-static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
+static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds, PyObject *packedMetadata{', ' + arg_decls if len(signature) > 0 else ''}) {{
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
   std::string name = "";
   name.append(kernelName);
   void *workspace_addr_ptr = NULL;
+  void *proton_buf_ptr = NULL;
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
   workspace_addr_ptr = {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
   ''' if workspace_size > 0 else ''}
+  {f'''
+  uint64_t protonBufSize = {proton_scratch_size} * blockNum4Workspace;
+  proton_buf_ptr = {get_backend_func("allocate_memory", "protonBufSize", "stream")}
+  if (!proton_buf_ptr) {{
+    {proton_alloc_fail_code}
+  }}
+  PyDict_SetItemString(packedMetadata, "_proton_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_buf_ptr)));
+  PyDict_SetItemString(packedMetadata, "_proton_buffer_size", PyLong_FromUnsignedLongLong(static_cast<uint64_t>({proton_scratch_size} * blockNum4Workspace)));
+  ''' if proton_scratch_size > 0 else ''}
   {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
     uint32_t blockNum = gridX * gridY * gridZ;
@@ -832,6 +895,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
       {'void* syncBlockLock __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}
       {'void* workspace_addr __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}
       {' '.join(f'{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));' for i, ty in signature.items() if i not in constants)}
+      {'void* proton_buf __attribute__((aligned(8)));' if proton_scratch_size > 0 and not metadata.force_simt_only else ''}
       {' '.join(f'{_ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}
       {'void* DTData __attribute__((aligned(8)));' if enable_device_print else ''}
     }} args = {{
@@ -841,6 +905,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
       {(lambda _rt: (', '.join(_rt) + ',') if _rt else '')(
         [f'static_cast<{_ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants]
       )}
+      {'static_cast<void*>(proton_buf_ptr),' if proton_scratch_size > 0 and not metadata.force_simt_only else ''}
       {', '.join(f'static_cast<{_ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
       {', static_cast<void*>(DTData)' if enable_device_print else ''}
     }};
@@ -936,7 +1001,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0]=="*" else "" for i, ty in signature.items()])};
-  _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds{', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''});
+  _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds, packedMetadata{', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''});
   if (PyErr_Occurred()) {{
     return NULL;
   }}

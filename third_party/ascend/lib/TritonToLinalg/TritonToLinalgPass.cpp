@@ -27,6 +27,7 @@
 #include "ascend/include/TritonToLinalg/LoadStoreConverter.h"
 #include "ascend/include/TritonToLinalg/TritonOpConverter.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
+#include "ascend/include/Dialect/TritonAscendProton/IR/TritonAscendProtonDialect.h"
 #include "ascend/include/TritonToLinalg/DescriptorConverter.h"
 #include "ascend/include/TritonToLinalg/HoistBroadcast.h"
 #include "ascend/include/TritonToLinalg/UseAnalysis.h"
@@ -443,7 +444,7 @@ void TritonToLinalgPass::addDynamicLegal(
       cf::ControlFlowDialect, tensor::TensorDialect, LLVM::LLVMDialect,
       bufferization::BufferizationDialect, memref::MemRefDialect,
       annotation::AnnotationDialect, hivm::HIVMDialect,
-      hfusion::HFusionDialect>();
+      hfusion::HFusionDialect, mlir::triton::proton::TritonAscendProtonDialect>();
 
   // add legal dialect on condition
   target.addLegalOp<ModuleOp>();
@@ -665,6 +666,7 @@ LogicalResult TritonToLinalgPass::processDescriptorOperations(ModuleOp moduleOp)
 {
     // --- ConversionTarget: dynamic legality checks ---
     mlir::ConversionTarget target(getContext());
+    target.addLegalDialect<mlir::triton::proton::TritonAscendProtonDialect>();
 
     // Dialect-level dynamic legality: ops are legal if none of their operands/results use TensorDescType.
     target.addDynamicallyLegalDialect<mlir::arith::ArithDialect, mlir::scf::SCFDialect, triton::TritonDialect>(
@@ -698,8 +700,9 @@ LogicalResult TritonToLinalgPass::processDescriptorOperations(ModuleOp moduleOp)
 LogicalResult TritonToLinalgPass::processPtrBroadcastOperations(ModuleOp moduleOp)
 {
     // --- ConversionTarget: dynamic legality checks ---
-    mlir::ConversionTarget target(getContext());
-    target.addLegalOp<triton::SplatOp>();
+mlir::ConversionTarget target(getContext());
+  target.addLegalDialect<mlir::triton::proton::TritonAscendProtonDialect>();
+  target.addLegalOp<triton::SplatOp>();
     target.addLegalOp<triton::AddPtrOp>();
     target.addDynamicallyLegalOp<triton::BroadcastOp>([](triton::BroadcastOp op) {
         if (op->hasAttr("MetaUse")) {
@@ -746,6 +749,7 @@ LogicalResult TritonToLinalgPass::processImplicitPermuteOperations(ModuleOp modu
 LogicalResult TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp)
 {
   mlir::ConversionTarget target(getContext());
+  target.addLegalDialect<mlir::triton::proton::TritonAscendProtonDialect>();
   target.addLegalOp<arith::ConstantOp>();
   target.addDynamicallyLegalOp<memref::ReinterpretCastOp>(
       [](memref::ReinterpretCastOp op) {

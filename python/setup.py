@@ -478,7 +478,6 @@ class CMakeBuild(build_ext):
             cmake_args += [
                 "-DCMAKE_C_COMPILER=clang",
                 "-DCMAKE_CXX_COMPILER=clang++",
-                "-DCMAKE_LINKER=lld",
                 "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
                 "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
                 "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",

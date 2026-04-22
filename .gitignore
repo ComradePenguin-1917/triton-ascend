@@ -89,3 +89,6 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+# opencode cache
+.sisyphus/

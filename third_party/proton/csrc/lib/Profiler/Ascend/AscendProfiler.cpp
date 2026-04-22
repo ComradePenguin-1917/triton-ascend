@@ -9,10 +9,12 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <cstring>
-#include <iostream>
+#include <cstdlib>
 #include <memory>
 #include <map>
 #include <atomic>
+#include <stdexcept>
+#include <vector>
 
 namespace proton {
 
@@ -42,13 +44,11 @@ int32_t profCtrlHandle(uint32_t ctrlType, void *ctrlData, uint32_t dataLen) {
 
   if (ctrlType == 1) {
     MsprofCommandHandle *handle = static_cast<MsprofCommandHandle *>(ctrlData);
-    if (handle->type >= 6)  // 6 is not used
+    if (handle->type >= 6) // 6 is not used
       return 1;
-    if (handle->type == 1) {  // init - 0, start - 1
+    if (handle->type == 1) { // init - 0, start - 1
       g_MsprofFlagL0 = ((0x00000800ULL & handle->profSwitch) == 0x00000800ULL) ? 1 : 0;
       g_MsprofFlagL1 = ((0x00000002ULL & handle->profSwitch) == 0x00000002ULL) ? 1 : 0;
-      std::cerr << "[AscendProfiler] msprof profiling started: L0="
-                << g_MsprofFlagL0 << ", L1=" << g_MsprofFlagL1 << std::endl;
     }
   }
   return 0;
@@ -84,7 +84,7 @@ struct AscendProfiler::AscendProfilerPimpl
     size_t externId;
   };
 
-  std::map<uint64_t, KernelLaunchInfo> pendingKernels;  // correlationId -> info
+  std::map<uint64_t, KernelLaunchInfo> pendingKernels; // correlationId -> info
 
   // Atomic counter for generating unique correlation IDs
   std::atomic<uint64_t> nextCorrelationId{1};
@@ -106,9 +106,7 @@ struct AscendProfiler::AscendProfilerPimpl
       return 0;
     }
 
-    // Access pImpl through friend class or public method
-    // We'll add a public method to AscendProfiler to get pImpl
-    if (auto *pImpl = dynamic_cast<AscendProfilerPimpl*>(profiler->getPimpl())) {
+    if (auto *pImpl = dynamic_cast<AscendProfilerPimpl *>(profiler->getPimpl())) {
       pImpl->handleKernelLaunch(stream, kernelInfo);
     }
 
@@ -117,11 +115,7 @@ struct AscendProfiler::AscendProfilerPimpl
 
   // Handle kernel launch callback from RT
   void handleKernelLaunch(void *stream, void *kernelInfo) {
-    std::cerr << "[AscendProfiler::handleKernelLaunch] CALLBACK INVOKED! stream="
-              << stream << ", kernelInfo=" << kernelInfo << std::endl;
-
     if (!isStarted) {
-      std::cerr << "[AscendProfiler::handleKernelLaunch] Profiling not started, ignoring" << std::endl;
       return;
     }
 
@@ -132,20 +126,16 @@ struct AscendProfiler::AscendProfilerPimpl
     uint64_t correlationId = nextCorrelationId.fetch_add(1);
 
     // Get current scope from profiler's correlation tracking
-    // This links the kernel to the current Python scope
     auto &correlation = this->profiler.correlation;
-
-    std::cerr << "[AscendProfiler::handleKernelLaunch] externIdQueue.size()="
-              << correlation.externIdQueue.size() << std::endl;
 
     if (!correlation.externIdQueue.empty()) {
       size_t externId = correlation.externIdQueue.back();
 
       // Record kernel launch
       KernelLaunchInfo info;
-      info.name = "kernel_" + std::to_string(correlationId);  // Will be replaced with actual name if available
+      info.name = "kernel_" + std::to_string(correlationId);
       info.startTime = timestamp;
-      info.deviceId = 0;  // Default device
+      info.deviceId = 0; // Default device
       info.externId = externId;
 
       pendingKernels[correlationId] = info;
@@ -153,13 +143,6 @@ struct AscendProfiler::AscendProfilerPimpl
       // Correlate this kernel with the current scope
       correlation.correlate(correlationId);
       correlation.submit(correlationId);
-
-      std::cerr << "[AscendProfiler::handleKernelLaunch] Recorded kernel launch: correlationId="
-                << correlationId << ", externId=" << externId << ", timestamp=" << timestamp
-                << ", pendingKernels.size()=" << pendingKernels.size() << std::endl;
-    } else {
-      std::cerr << "[AscendProfiler::handleKernelLaunch] WARNING: externIdQueue is empty, "
-                << "kernel not recorded!" << std::endl;
     }
   }
 
@@ -179,9 +162,6 @@ struct AscendProfiler::AscendProfilerPimpl
       for (auto *data : this->profiler.getDataSet()) {
         data->addMetric(info.externId, metric);
       }
-
-      std::cerr << "[AscendProfiler::completeKernel] Added metric: correlationId="
-                << correlationId << ", duration=" << (endTime - info.startTime) << std::endl;
     }
 
     // Report to msprof if enabled
@@ -205,28 +185,21 @@ struct AscendProfiler::AscendProfilerPimpl
       return;
     }
 
-    std::cerr << "[AscendProfiler] Starting profiling..." << std::endl;
-
     // 0. Ensure ACL runtime is initialized
     aclError ret = aclInit(nullptr);
     if (ret == ACL_SUCCESS) {
       aclInitializedByUs = true;
-      std::cerr << "[AscendProfiler] ACL initialized by profiler" << std::endl;
     } else if (ret == ACL_ERROR_REPEAT_INITIALIZE) {
       aclInitializedByUs = false;
-      std::cerr << "[AscendProfiler] ACL already initialized" << std::endl;
     } else {
-      throw std::runtime_error("Failed to initialize ACL runtime: aclInit returned " +
+      throw std::runtime_error("[PROTON] Failed to initialize ACL runtime: aclInit returned " +
                                std::to_string(ret));
     }
 
     // 1. Register RT kernel callback for automatic kernel tracking
-    // This is the CUDA CUPTI equivalent for Ascend!
     g_activeProfiler.store(&this->profiler);
 
-    // Note: rtSetKernelReportCallback is from runtime/kernel.h
-    // We need to declare it here since we're using it dynamically
-    typedef int32_t (*rtSetKernelReportCallbackFunc)(void* callback);
+    typedef int32_t (*rtSetKernelReportCallbackFunc)(void *callback);
     void *rtLib = dlopen("libascendcl.so", RTLD_LAZY | RTLD_NOLOAD);
     if (!rtLib) {
       rtLib = dlopen("libascendcl.so", RTLD_LAZY);
@@ -236,68 +209,57 @@ struct AscendProfiler::AscendProfilerPimpl
       auto setCallback = reinterpret_cast<rtSetKernelReportCallbackFunc>(
           dlsym(rtLib, "rtSetKernelReportCallback"));
       if (setCallback) {
-        int32_t cbRet = setCallback(reinterpret_cast<void*>(&AscendProfilerPimpl::rtKernelReportCallbackStatic));
-        if (cbRet == 0) {
-          std::cerr << "[AscendProfiler] RT kernel callback registered successfully" << std::endl;
-        } else {
-          std::cerr << "[AscendProfiler] Warning: RT kernel callback registration returned "
-                    << cbRet << std::endl;
-        }
-      } else {
-        std::cerr << "[AscendProfiler] Warning: rtSetKernelReportCallback not found" << std::endl;
+        setCallback(reinterpret_cast<void *>(&AscendProfilerPimpl::rtKernelReportCallbackStatic));
       }
-    } else {
-      std::cerr << "[AscendProfiler] Warning: Could not load libascendcl.so for RT callbacks" << std::endl;
     }
 
     // 2. Register msprof callback (CCE module = 8)
-    // This allows msprof to collect kernel performance data
     msprofEnabled = (msprof::registerCallback<false>(8, profCtrlHandle) == 0);
-    if (msprofEnabled) {
-      std::cerr << "[AscendProfiler] msprof callback registered successfully" << std::endl;
-    } else {
-      std::cerr << "[AscendProfiler] Warning: msprof callback registration failed, "
-                << "continuing with ACL profiling only" << std::endl;
-    }
 
-    // 3. Initialize ACL Profiling (for backup/additional data)
-    outputPath = "/tmp/ascend_profiling";
+    // 3. Initialize ACL Profiling
+    const char *envPath = std::getenv("PROTON_ASCEND_OUTPUT_PATH");
+    outputPath = (envPath && envPath[0] != '\0') ? envPath : "/tmp/ascend_profiling";
+
     ret = ascend::initProfiling<false>(outputPath.c_str(), outputPath.size());
     if (ret != ACL_SUCCESS) {
-      std::cerr << "[AscendProfiler] Warning: ACL profiling init failed: "
-                << ret << std::endl;
-    } else {
-      std::cerr << "[AscendProfiler] ACL profiling initialized" << std::endl;
+      throw std::runtime_error("[PROTON] ACL profiling init failed: " +
+                               std::to_string(ret));
     }
 
-    // 3. Create ACL profiling configuration
-    uint32_t deviceIdList[] = {0};
-    uint32_t deviceNums = 1;
+    // 4. Create ACL profiling configuration with dynamic device detection
+    uint32_t deviceCount = 0;
+    ret = aclrtGetDeviceCount(&deviceCount);
+    if (ret != ACL_SUCCESS || deviceCount == 0) {
+      throw std::runtime_error("[PROTON] Failed to get device count: aclrtGetDeviceCount returned " +
+                               std::to_string(ret));
+    }
+
+    std::vector<uint32_t> deviceIdList(deviceCount);
+    for (uint32_t i = 0; i < deviceCount; ++i) {
+      deviceIdList[i] = i;
+    }
+
     uint64_t profCategory = ACL_PROF_ACL_API | ACL_PROF_TASK_TIME;
 
     profConfig = aclprofCreateConfig(
-        deviceIdList, deviceNums,
+        deviceIdList.data(), deviceCount,
         ACL_AICORE_NONE, nullptr,
         profCategory);
 
     if (!profConfig) {
-      std::cerr << "[AscendProfiler] Warning: Failed to create ACL profiling config"
-                << std::endl;
-    } else {
-      // 4. Start ACL profiling
-      ret = ascend::startProfiling<false>(profConfig);
-      if (ret != ACL_SUCCESS) {
-        std::cerr << "[AscendProfiler] Warning: Failed to start ACL profiling: "
-                  << ret << std::endl;
-        aclprofDestroyConfig(profConfig);
-        profConfig = nullptr;
-      } else {
-        std::cerr << "[AscendProfiler] ACL profiling started" << std::endl;
-      }
+      throw std::runtime_error("[PROTON] Failed to create ACL profiling config");
+    }
+
+    // 5. Start ACL profiling
+    ret = ascend::startProfiling<false>(profConfig);
+    if (ret != ACL_SUCCESS) {
+      aclprofDestroyConfig(profConfig);
+      profConfig = nullptr;
+      throw std::runtime_error("[PROTON] Failed to start ACL profiling: " +
+                               std::to_string(ret));
     }
 
     isStarted = true;
-    std::cerr << "[AscendProfiler] Profiling started successfully" << std::endl;
   }
 
   void doFlush() override {
@@ -305,15 +267,10 @@ struct AscendProfiler::AscendProfilerPimpl
       return;
     }
 
-    std::cerr << "[AscendProfiler] Flushing profiling data..." << std::endl;
-    std::cerr << "[AscendProfiler] Current pendingKernels.size() = "
-              << pendingKernels.size() << std::endl;
-
     // Synchronize device to ensure all kernels are completed
     ascend::synchronizeDevice<false>(0);
 
     // Complete all pending kernels
-    // Get current timestamp as end time for all pending kernels
     uint64_t currentTime = msprof::getSysCycleTime<false>();
 
     std::vector<uint64_t> completedIds;
@@ -322,11 +279,6 @@ struct AscendProfiler::AscendProfilerPimpl
       completeKernel(correlationId, currentTime);
       completedIds.push_back(correlationId);
     }
-
-    std::cerr << "[AscendProfiler] Completed " << completedIds.size()
-              << " pending kernels during flush" << std::endl;
-
-    std::cerr << "[AscendProfiler] Flush completed" << std::endl;
   }
 
   void doStop() override {
@@ -334,26 +286,18 @@ struct AscendProfiler::AscendProfilerPimpl
       return;
     }
 
-    std::cerr << "[AscendProfiler] Stopping profiling..." << std::endl;
-
     // Flush any remaining data
     doFlush();
 
     // 1. Stop ACL profiling
     if (profConfig) {
-      aclError ret = ascend::stopProfiling<false>(profConfig);
-      if (ret != ACL_SUCCESS) {
-        std::cerr << "[AscendProfiler] Warning: aclprofStop returned " << ret << std::endl;
-      }
+      ascend::stopProfiling<false>(profConfig);
       aclprofDestroyConfig(profConfig);
       profConfig = nullptr;
     }
 
     // 2. Finalize ACL profiling
-    aclError ret = ascend::finalizeProfiling<false>();
-    if (ret != ACL_SUCCESS) {
-      std::cerr << "[AscendProfiler] Warning: aclprofFinalize returned " << ret << std::endl;
-    }
+    ascend::finalizeProfiling<false>();
 
     // 3. Finalize msprof
     if (msprofEnabled) {
@@ -364,7 +308,6 @@ struct AscendProfiler::AscendProfilerPimpl
     g_activeProfiler.store(nullptr);
 
     isStarted = false;
-    std::cerr << "[AscendProfiler] Profiling stopped" << std::endl;
   }
 
   void reportKernelToMsprof(const KernelLaunchInfo &info, uint64_t endTime) {
@@ -401,7 +344,7 @@ struct AscendProfiler::AscendProfilerPimpl
       nodeBasicInfo.data.nodeBasicInfo.opName = opNameHashId;
       nodeBasicInfo.data.nodeBasicInfo.opType = opNameHashId;
       nodeBasicInfo.data.nodeBasicInfo.taskType = MSPROF_GE_TASK_TYPE_AI_CORE;
-      nodeBasicInfo.data.nodeBasicInfo.blockDim = 1;  // Default to 1
+      nodeBasicInfo.data.nodeBasicInfo.blockDim = 1;
 
       msprof::reportCompactInfo<false>(
           0, static_cast<void *>(&nodeBasicInfo), sizeof(MsprofCompactInfo));
@@ -421,15 +364,41 @@ void AscendProfiler::doSetMode(const std::vector<std::string> &modeAndOptions) {
   // This implementation satisfies the pure virtual method requirement
 }
 
-uint64_t AscendProfiler::recordKernelLaunch(const char* kernelName, uint32_t gridX,
-                                             uint32_t gridY, uint32_t gridZ) {
-  auto *pimpl = dynamic_cast<AscendProfilerPimpl*>(pImpl.get());
+void AscendProfiler::startOp(const Scope &scope) {
+  GPUProfiler<AscendProfiler>::startOp(scope);
+  scopeStartTimes_[scope.scopeId] = msprof::getSysCycleTime<false>();
+}
 
-  std::cerr << "[AscendProfiler::recordKernelLaunch] Called from launcher: kernelName="
-            << kernelName << ", pimpl=" << (void*)pimpl;
+void AscendProfiler::stopOp(const Scope &scope) {
+  GPUProfiler<AscendProfiler>::stopOp(scope);
+  auto it = scopeStartTimes_.find(scope.scopeId);
+  if (it == scopeStartTimes_.end())
+    return;
+  uint64_t startTime = it->second;
+  uint64_t endTime = msprof::getSysCycleTime<false>();
+  scopeStartTimes_.erase(it);
+
+  if (endTime <= startTime)
+    return;
+
+  uint32_t deviceId = 0;
+  int32_t currentDevice = 0;
+  if (aclrtGetDevice(&currentDevice) == ACL_SUCCESS && currentDevice >= 0)
+    deviceId = static_cast<uint32_t>(currentDevice);
+
+  auto metric = std::make_shared<KernelMetric>(
+      startTime, endTime, 1, deviceId,
+      static_cast<uint64_t>(DeviceType::ASCEND), 0);
+
+  for (auto *data : getDataSet())
+    data->addMetric(scope.scopeId, metric);
+}
+
+uint64_t AscendProfiler::recordKernelLaunch(const char *kernelName, uint32_t gridX,
+                                             uint32_t gridY, uint32_t gridZ) {
+  auto *pimpl = dynamic_cast<AscendProfilerPimpl *>(pImpl.get());
 
   if (!pimpl) {
-    std::cerr << " - pimpl is NULL!" << std::endl;
     return 0;
   }
 
@@ -441,10 +410,7 @@ uint64_t AscendProfiler::recordKernelLaunch(const char* kernelName, uint32_t gri
     deviceId = static_cast<uint32_t>(currentDevice);
   }
 
-  std::cerr << ", isStarted=" << pimpl->isStarted << ", deviceId=" << deviceId << std::endl;
-
   if (!pimpl->isStarted) {
-    std::cerr << "[AscendProfiler::recordKernelLaunch] Profiler not started, ignoring" << std::endl;
     return 0;
   }
 
@@ -457,10 +423,6 @@ uint64_t AscendProfiler::recordKernelLaunch(const char* kernelName, uint32_t gri
   // Get current scope from profiler's correlation tracking
   auto &correlation = this->correlation;
 
-  std::cerr << "[AscendProfiler::recordKernelLaunch] Called from launcher: kernelName="
-            << kernelName << ", correlationId=" << correlationId
-            << ", externIdQueue.size()=" << correlation.externIdQueue.size() << std::endl;
-
   if (!correlation.externIdQueue.empty()) {
     size_t externId = correlation.externIdQueue.back();
 
@@ -468,7 +430,7 @@ uint64_t AscendProfiler::recordKernelLaunch(const char* kernelName, uint32_t gri
     AscendProfilerPimpl::KernelLaunchInfo info;
     info.name = kernelName;
     info.startTime = timestamp;
-    info.deviceId = deviceId;  // Use auto-detected device ID from ACL
+    info.deviceId = deviceId;
     info.externId = externId;
 
     pimpl->pendingKernels[correlationId] = info;
@@ -476,20 +438,13 @@ uint64_t AscendProfiler::recordKernelLaunch(const char* kernelName, uint32_t gri
     // Correlate this kernel with the current scope
     correlation.correlate(correlationId);
     correlation.submit(correlationId);
-
-    std::cerr << "[AscendProfiler::recordKernelLaunch] Recorded kernel: correlationId="
-              << correlationId << ", externId=" << externId << ", timestamp=" << timestamp
-              << ", pendingKernels.size()=" << pimpl->pendingKernels.size() << std::endl;
-  } else {
-    std::cerr << "[AscendProfiler::recordKernelLaunch] WARNING: externIdQueue is empty, "
-              << "kernel not recorded!" << std::endl;
   }
 
   return correlationId;
 }
 
 void AscendProfiler::recordKernelComplete(uint64_t correlationId) {
-  auto *pimpl = dynamic_cast<AscendProfilerPimpl*>(pImpl.get());
+  auto *pimpl = dynamic_cast<AscendProfilerPimpl *>(pImpl.get());
   if (!pimpl || !pimpl->isStarted || correlationId == 0) {
     return;
   }

@@ -31,8 +31,12 @@ def _get_backend_default_path(backend: str) -> str:
 
 
 def _resolve_backend(backend: str) -> tuple[str, str, str]:
-    if backend in ("npu", "ascend", "instrumentation"):
+    if backend in ("npu", "ascend"):
         return "instrumentation", "", "npu"
+    if backend == "npu-native":
+        return "npu", "", ""
+    if backend == "instrumentation":
+        return "instrumentation", "", ""
     return backend, _get_backend_default_path(backend), ""
 
 

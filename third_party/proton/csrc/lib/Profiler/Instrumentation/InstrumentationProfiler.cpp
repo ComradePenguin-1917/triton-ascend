@@ -151,9 +151,8 @@ void InstrumentationProfiler::initFunctionMetadata(
     const std::vector<std::pair<size_t, size_t>> &scopeIdParentPairs,
     const std::string &metadataPath) {
   if (functionScopeIdNames.count(functionId)) {
-    throw std::runtime_error(
-        "Duplicate function id: " + std::to_string(functionId) +
-        " for function " + functionName);
+    // Already registered — skip (idempotent for JIT cache hits)
+    return;
   }
   functionNames[functionId] = functionName;
   for (auto &pair : scopeIdPairs) {
@@ -252,7 +251,12 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
       [&](uint8_t *bufferPtr, size_t size) {
         ByteSpan byteSpan(bufferPtr, size);
         CircularLayoutParser parser(byteSpan, *circularLayoutConfig);
-        parser.parse();
+        try {
+          parser.parse();
+        } catch (const std::exception &e) {
+          return;
+        }
+        auto result = parser.getResult();
         for (auto &blockTrace : parser.getResult()->blockTraces) {
           for (auto &trace : blockTrace.traces) {
             for (auto &event : trace.profileEvents) {

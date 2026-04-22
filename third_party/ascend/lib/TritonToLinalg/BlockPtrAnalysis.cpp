@@ -489,6 +489,25 @@ void BlockDataParser::parse(
       operand.dump();
       llvm_unreachable("encountered AddPtrOp produced by unsupported operation");
     }
+  } else if (auto unrealizedCastOp =
+                 operand.getDefiningOp<UnrealizedConversionCastOp>()) {
+    // UnrealizedConversionCastOp is a transparent cast — parse its inputs.
+    // If it has no inputs (e.g., a placeholder), fall back to the remapped
+    // value for pointer types, or treat as a scalar for integer types.
+    if (unrealizedCastOp.getInputs().size() == 1) {
+      parse(unrealizedCastOp.getInputs()[0], data, loc, rewriter, known);
+    } else if (isa<triton::PointerType>(operand.getType())) {
+      auto remappedV = rewriter.getRemappedValue(operand);
+      if (remappedV) {
+        data.setSource(remappedV);
+      } else {
+        LLVM_DEBUG({ llvm::dbgs() << "Skipping unsupported UnrealizedConversionCastOp with no inputs: " << operand << "\n"; });
+      }
+    } else if (isa<IntegerType>(operand.getType())) {
+      data.setScalar(getOpFoldResultOfLayoutInfo(operand, rewriter));
+    } else {
+      LLVM_DEBUG({ llvm::dbgs() << "Skipping unsupported UnrealizedConversionCastOp: " << operand << "\n"; });
+    }
   } else {
     operand.dump();
     llvm_unreachable("encountered AddPtrOp produced by unsupported operation");
@@ -1808,6 +1827,7 @@ void BlockDataParser::rewriteLoopOp(
   }
 
   rewriter.restoreInsertionPoint(origIp);
+
   IRMapping mapping;
 
   // Create a new LoopOp that uses updated init args and same loop body

@@ -340,6 +340,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   m.def("add_triton_ascend_proton_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::proton::createTritonAscendProtonToHIVMPass());});
 
+  m.def("add_triton_ascend_proton_lower_cycle_counter", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::proton::createTritonAscendProtonLowerCycleCounterPass());});
+
   m.def("add_triton_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());});
 

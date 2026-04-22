@@ -22,6 +22,7 @@ import ctypes
 import functools
 import hashlib
 import glob
+import json
 import os
 import re
 import subprocess
@@ -93,9 +94,8 @@ def make_ttir(mod, metadata, opt):
 
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
-    # use triton_adapter to lower Triton-MLIR to linalg
-    # Get Triton-MLIR as string
     ttir_code = str(mod)
+    _parse_proton_metadata(ttir_code, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
         dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
@@ -142,7 +142,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             compile_on_910_95,
             force_simt_template
         )
-        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm)
         ascend.passes.ttir.add_triton_to_llvm(pm)
@@ -160,7 +159,23 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             enable_select_analysis,
             compile_on_910_95
         )
+        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm)
+        ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm)
         pm.run(mod)
+
+        mod_str = str(mod)
+        with open('/tmp/gemm_after_proton.mlir', 'w') as f:
+            f.write(mod_str)
+
+        # Extract proton profiling attributes from the lowered function.
+        mod_str = str(mod)
+        proton_scratch_match = re.search(r'proton_scratch_size\s*=\s*(\d+)', mod_str)
+        if proton_scratch_match:
+            scratch_size = int(proton_scratch_match.group(1))
+            metadata["proton_scratch_size"] = scratch_size
+            total_units_match = re.search(r'proton_total_units\s*=\s*(\d+)', mod_str)
+            if total_units_match:
+                metadata["proton_total_units"] = int(total_units_match.group(1))
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -331,6 +346,39 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # init the ub bits of triton kernel for inductor autotune using
     metadata["required_ub_bits"] = 0
     return linalg, metadata
+
+
+def _parse_proton_metadata(ttir: str, metadata: dict):
+    """
+    Parse TTIR for ascend_proton.record ops to extract scope names.
+    If proton records are found, generate metadata JSON file and call
+    libproton.init_function_metadata.
+    """
+    PROTON_RECORD_REGEX = r'ascend_proton\.record\s+start\s+"([^"]+)"'
+
+    scope_names = re.findall(PROTON_RECORD_REGEX, ttir)
+    if not scope_names:
+        return metadata
+
+    unique_scopes = list(dict.fromkeys(scope_names))
+    proton_scratch_size = 4140
+    proton_scope_names = ":".join(unique_scopes)
+
+    metadata["proton_scratch_size"] = proton_scratch_size
+    metadata["proton_scope_names"] = proton_scope_names
+    metadata["proton_function_id"] = int(metadata["hash"][:16], 16)
+
+    metadata_json = {
+        "profile_scratch_size": proton_scratch_size,
+        "num_warps": 1,
+    }
+    proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
+    json_path = os.path.join(proton_tmpdir, "proton_metadata.json")
+    with open(json_path, "w") as f:
+        json.dump(metadata_json, f)
+    metadata["proton_metadata_path"] = json_path
+
+    return metadata
 
 
 def _parse_ttir_metadata(ttir: str, metadata: dict):
@@ -989,11 +1037,17 @@ class AscendBackend(BaseBackend):
             kernel_name = kernel_name_orig[-KERNEL_NAME_MAX_LEN:]
         else:
             kernel_name = kernel_name_orig
+        pss = getattr(metadata, 'proton_scratch_size', None)
+        pfid = getattr(metadata, 'proton_function_id', None)
+        psn = getattr(metadata, 'proton_scope_names', None)
         return {
             "kernel_name": kernel_name,
             "hash": metadata.hash,
             "debug": metadata.debug,
             "tensor_kinds": metadata.tensor_kinds,
+            "proton_scratch_size": pss,
+            "proton_function_id": pfid,
+            "proton_scope_names": psn,
         }
 
     def get_codegen_implementation(self):
