@@ -26,7 +26,12 @@ void CircularLayoutParser::parse() {
   uint32_t pos = buffer.position();
   for (int i = 0; i < numBlocks; i++) {
     buffer.seek(pos);
-    parseBlock();
+    try {
+      parseBlock();
+    } catch (const ParserException &e) {
+      // Skip corrupted blocks and continue parsing remaining blocks.
+      // Partial traces from valid blocks are still usable.
+    }
     pos += scratchMemSize;
   }
 }

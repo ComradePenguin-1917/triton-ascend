@@ -185,7 +185,8 @@ private:
         loc, i32Type, blockIdxI64);
     storeI32(builder, loc, blockIdVal, kOffBlockId);
 
-    auto procIdVal = builder.create<mlir::arith::ConstantIntOp>(loc, 0, i32Type);
+    // On Ascend, each block runs on one AICore, so procId = blockIdx.
+    auto procIdVal = builder.create<mlir::arith::TruncIOp>(loc, i32Type, blockIdxI64);
     storeI32(builder, loc, procIdVal, kOffProcId);
 
     auto bufSizeVal = builder.create<mlir::arith::ConstantIntOp>(
@@ -227,6 +228,11 @@ private:
       auto ctx = builder.getContext();
       auto i64Type = mlir::IntegerType::get(ctx, 64);
 
+      // Record the time just before the final barrier+counter for finalization
+      // overhead measurement: postFinalTime - preFinalTime = finalization cost.
+      auto preFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
+      storeI64(builder, loc, preFinalCnt.getResult(), kOffPreFinalTime);
+
       auto postFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
       storeI64(builder, loc, postFinalCnt.getResult(), kOffPostFinalTime);
     }
@@ -243,13 +249,7 @@ private:
                                           mlir::ValueRange{fullIdx});
   }
 
-  void storeI32Dyn(mlir::OpBuilder &builder, mlir::Location loc,
-                    mlir::Value val, mlir::Value wordOffset)
-  {
-    auto fullIdx = builder.create<mlir::arith::AddIOp>(loc, sectionOffset, wordOffset);
-    builder.create<mlir::memref::StoreOp>(loc, val, buffer,
-                                          mlir::ValueRange{fullIdx});
-  }
+  
 
   void storeI64(mlir::OpBuilder &builder, mlir::Location loc,
                 mlir::Value val, int32_t wordOffset)

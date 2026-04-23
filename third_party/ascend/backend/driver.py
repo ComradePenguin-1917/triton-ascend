@@ -839,11 +839,13 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
-  workspace_addr_ptr = {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  at::Tensor workspace_tensor = {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  workspace_addr_ptr = workspace_tensor.data_ptr();
   ''' if workspace_size > 0 else ''}
   {f'''
   uint64_t protonBufSize = {proton_scratch_size} * blockNum4Workspace;
-  proton_buf_ptr = {get_backend_func("allocate_memory", "protonBufSize", "stream")}
+  at::Tensor proton_buf_tensor = {get_backend_func("allocate_memory", "protonBufSize", "stream")}
+  proton_buf_ptr = proton_buf_tensor.data_ptr();
   if (!proton_buf_ptr) {{
     {proton_alloc_fail_code}
   }}

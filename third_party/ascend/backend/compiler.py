@@ -163,10 +163,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm)
         pm.run(mod)
 
-        mod_str = str(mod)
-        with open('/tmp/gemm_after_proton.mlir', 'w') as f:
-            f.write(mod_str)
-
         # Extract proton profiling attributes from the lowered function.
         mod_str = str(mod)
         proton_scratch_match = re.search(r'proton_scratch_size\s*=\s*(\d+)', mod_str)

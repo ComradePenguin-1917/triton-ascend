@@ -288,7 +288,7 @@ def allocate_memory(size, stream):
 
 @backend_strategy_registry.register("torch_npu", "allocate_memory")
 def allocate_memory(size, stream):
-    return f"const_cast<void *>(at::empty({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte)).storage().data());"
+    return f"at::zeros({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte));"
 
 
 @backend_strategy_registry.register("mindspore", "allocate_sync_block_lock")
