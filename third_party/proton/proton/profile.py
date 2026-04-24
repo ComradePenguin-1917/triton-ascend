@@ -1,7 +1,7 @@
 import functools
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import triton
 
@@ -9,8 +9,16 @@ from triton._C.libproton import proton as libproton
 
 from .flags import is_command_line, set_profiling_off, set_profiling_on
 from .hook import register_triton_hook, unregister_triton_hook
+from .mode import BaseMode, InstrumentationMode
 
 DEFAULT_PROFILE_NAME = "proton"
+
+DEFAULT_DATA_SEGMENT_BYTES = 4096
+_current_data_segment_bytes = DEFAULT_DATA_SEGMENT_BYTES
+
+
+def get_data_segment_bytes() -> int:
+    return _current_data_segment_bytes
 
 
 def _select_backend() -> str:
@@ -57,6 +65,7 @@ def start(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     hook: Optional[str] = None,
+    mode: Optional[Union[str, BaseMode]] = None,
 ):
     if is_command_line():
         return
@@ -69,12 +78,36 @@ def start(
 
     _check_env(backend)
 
-    profiler_name, profiler_path, mode = _resolve_backend(backend)
+    profiler_name, profiler_path, default_mode = _resolve_backend(backend)
+
+    # Resolve mode: if user provides a mode object/string, use it;
+    # otherwise fall back to the backend's default mode string.
+    # For InstrumentationMode objects, we override the mode name with the
+    # backend-specific default (e.g. "npu" for Ascend) since the C++ side
+    # expects the device type as the first field in the mode string.
+    data_segment_bytes = None
+    if mode is not None:
+        if isinstance(mode, BaseMode):
+            opts = []
+            if isinstance(mode, InstrumentationMode):
+                data_segment_bytes = mode.buffer_size if mode.buffer_size > 0 else DEFAULT_DATA_SEGMENT_BYTES
+                opts.append(f"buffer_size={mode.buffer_size}")
+                optimizations_str = ",".join([str(opt) for opt in mode.optimizations])
+                opts.append(f"optimizations={optimizations_str}")
+            mode_str = f"{default_mode}:{':'.join(opts)}" if opts else default_mode
+        else:
+            mode_str = mode
+    else:
+        mode_str = default_mode
+
+    if data_segment_bytes is not None:
+        global _current_data_segment_bytes
+        _current_data_segment_bytes = data_segment_bytes
 
     set_profiling_on()
     if hook == "triton":
         register_triton_hook()
-    return libproton.start(name, context, data, profiler_name, profiler_path, mode)
+    return libproton.start(name, context, data, profiler_name, profiler_path, mode_str)
 
 
 def activate(session: Optional[int] = 0) -> None:
@@ -108,10 +141,11 @@ def _profiling(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     hook: Optional[str] = None,
+    mode: Optional[Union[str, BaseMode]] = None,
 ):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        session = start(name, context=context, data=data, backend=backend, hook=hook)
+        session = start(name, context=context, data=data, backend=backend, hook=hook, mode=mode)
         ret = func(*args, **kwargs)
         deactivate(session)
         return ret
@@ -127,10 +161,11 @@ def profile(
     data: Optional[str] = "tree",
     backend: Optional[str] = None,
     hook: Optional[str] = None,
+    mode: Optional[Union[str, BaseMode]] = None,
 ):
     if func is None:
         def decorator(f):
-            return _profiling(f, name=name, context=context, data=data, backend=backend, hook=hook)
+            return _profiling(f, name=name, context=context, data=data, backend=backend, hook=hook, mode=mode)
 
         return decorator
-    return _profiling(func, name=name, context=context, data=data, backend=backend, hook=hook)
+    return _profiling(func, name=name, context=context, data=data, backend=backend, hook=hook, mode=mode)

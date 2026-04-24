@@ -32,6 +32,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -44,9 +45,9 @@ namespace {
 static constexpr int32_t kHeaderBytes = 40;   // 4*i32 + 3*i64
 static constexpr int32_t kTotalUnits = 1;     // AICore = 1 unit
 static constexpr int32_t kCountVecBytes = kTotalUnits * 4;
-static constexpr int32_t kDataSegmentBytes = 4096;
-static constexpr int32_t kScratchMemSize =
-    kHeaderBytes + kCountVecBytes + kDataSegmentBytes; // 4140
+static constexpr int32_t kDefaultDataSegmentBytes = 4096;
+static constexpr int32_t kDefaultScratchMemSize =
+    kHeaderBytes + kCountVecBytes + kDefaultDataSegmentBytes; // 4140
 static constexpr uint32_t kPreamble = 0xdeadbeef;
 
 static constexpr int32_t kOffPreamble = 0;
@@ -65,7 +66,9 @@ static constexpr uint32_t kCycleUpperMask = 0x7FFu;
 
 class ProtonRecordConverter {
 public:
-  ProtonRecordConverter(mlir::Operation *funcOp) : funcOp(funcOp) {}
+  ProtonRecordConverter(mlir::Operation *funcOp, int32_t dataSegBytes)
+      : funcOp(funcOp), dataSegmentBytes(dataSegBytes),
+        scratchMemSize(kHeaderBytes + kCountVecBytes + dataSegBytes) {}
 
   mlir::LogicalResult convert()
   {
@@ -102,11 +105,13 @@ public:
 
 private:
   mlir::Operation *funcOp{nullptr};
+  int32_t dataSegmentBytes{kDefaultDataSegmentBytes};
+  int32_t scratchMemSize{kDefaultScratchMemSize};
   llvm::StringMap<uint32_t> scopeNameToId;
   llvm::SmallVector<std::string, 16> scopeNames;
   uint32_t numScopes{0};
   mlir::Value buffer;
-  // Per-block section offset (in i32 words): blockIdx * kScratchMemSize / 4
+  // Per-block section offset (in i32 words): blockIdx * scratchMemSize / 4
   // Each block writes to its own section of the proton buffer to avoid
   // concurrent writes from multiple AICore blocks.
   mlir::Value sectionOffset;
@@ -170,7 +175,7 @@ private:
     // those args directly. GetBlockIdxOp survives that transformation.
     auto blockIdxI64 = builder.create<mlir::hivm::GetBlockIdxOp>(loc, i64Type);
     auto scratchWordsI64 = builder.create<mlir::arith::ConstantIntOp>(
-        loc, static_cast<int64_t>(kScratchMemSize / 4), i64Type);
+        loc, static_cast<int64_t>(scratchMemSize / 4), i64Type);
     auto sectionOffI64 = builder.create<mlir::arith::MulIOp>(
         loc, blockIdxI64, scratchWordsI64);
     auto indexType = builder.getIndexType();
@@ -190,7 +195,7 @@ private:
     storeI32(builder, loc, procIdVal, kOffProcId);
 
     auto bufSizeVal = builder.create<mlir::arith::ConstantIntOp>(
-        loc, static_cast<int64_t>(kDataSegmentBytes), i32Type);
+        loc, static_cast<int64_t>(dataSegmentBytes), i32Type);
     storeI32(builder, loc, bufSizeVal, kOffBufSize);
 
     auto initSysCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
@@ -332,7 +337,7 @@ private:
         mlir::IntegerAttr::get(i32Type, numScopes));
     funcOp->setAttr(
         "proton_scratch_size",
-        mlir::IntegerAttr::get(i32Type, kScratchMemSize));
+        mlir::IntegerAttr::get(i32Type, scratchMemSize));
     funcOp->setAttr(
         "proton_total_units",
         mlir::IntegerAttr::get(i32Type, kTotalUnits));
@@ -377,13 +382,13 @@ struct ReadCycleCounterToGetSysCntLowering
     auto ctx = rewriter.getContext();
     auto i64Type = mlir::IntegerType::get(ctx, 64);
 
-    // Insert PipeBarrierOp(PIPE_ALL) before GetSysCntOp to ensure all prior
-    // pipeline operations complete before reading the cycle counter.
-    // Without this barrier, the AICore VLIW scheduler may bundle GetSysCnt
-    // with compute/DMA instructions in the same issue slot, causing the
-    // measured cycle count to reflect a point before the measured operation
-    // actually completes. This is the same pattern used by bishengir's Debug
-    // library (pipe_barrier(PIPE_ALL) before every timed operation).
+    // Insert PipeBarrierOp(PIPE_ALL) before GetSysCntOp to prevent the AICore
+    // VLIW scheduler from bundling start/end GetSysCnt reads in the same
+    // issue slot. Without this barrier, short scopes (e.g. 'init' with only
+    // 2 arithmetic ops) produce zero-duration timing entries because both
+    // GetSysCnt reads observe identical cycle values. GetSysCntOp also has
+    // MemoryEffects<[MemRead, MemWrite]> to prevent CSE from merging
+    // multiple GetSysCntOps.
     auto pipeAllAttr = mlir::hivm::PipeAttr::get(ctx, mlir::hivm::PIPE::PIPE_ALL);
     rewriter.create<mlir::hivm::PipeBarrierOp>(loc, pipeAllAttr);
 
@@ -398,6 +403,10 @@ struct TritonAscendProtonToHIVMPass
                                mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TritonAscendProtonToHIVMPass)
 
+  TritonAscendProtonToHIVMPass() = default;
+  TritonAscendProtonToHIVMPass(const TritonAscendProtonToHIVMPass &other)
+      : PassWrapper(other) {}
+
   mlir::StringRef getArgument() const final
   {
     return "ascend-proton-to-hivm";
@@ -407,6 +416,11 @@ struct TritonAscendProtonToHIVMPass
   {
     return "Lower Triton Ascend Proton ops to HIVM profiling annotations";
   }
+
+  Option<int32_t> dataSegmentBytes{
+      *this, "data-segment-bytes",
+      llvm::cl::desc("Size in bytes of the per-block circular data segment"),
+      llvm::cl::init(kDefaultDataSegmentBytes)};
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override
   {
@@ -427,7 +441,7 @@ struct TritonAscendProtonToHIVMPass
         return mlir::WalkResult::advance();
       }
 
-      ProtonRecordConverter converter(funcOp);
+      ProtonRecordConverter converter(funcOp, dataSegmentBytes);
       if (mlir::failed(converter.convert())) {
         failed = true;
         return mlir::WalkResult::interrupt();
@@ -501,9 +515,11 @@ void mlir::triton::proton::populateTritonAscendProtonToHIVMPatterns(
 }
 
 std::unique_ptr<mlir::Pass>
-mlir::triton::proton::createTritonAscendProtonToHIVMPass()
+mlir::triton::proton::createTritonAscendProtonToHIVMPass(int32_t dataSegmentBytes)
 {
-  return std::make_unique<TritonAscendProtonToHIVMPass>();
+  auto pass = std::make_unique<TritonAscendProtonToHIVMPass>();
+  pass->dataSegmentBytes = dataSegmentBytes;
+  return pass;
 }
 
 std::unique_ptr<mlir::Pass>

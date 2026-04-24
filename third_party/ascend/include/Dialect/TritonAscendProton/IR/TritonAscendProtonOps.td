@@ -154,10 +154,14 @@ def TritonAscendProton_ReadCycleCounterOp
   let summary = "Read Ascend AICore cycle counter";
 
   let description = [{
-    Reads the AICore system counter (GetSysCnt). Unlike hivm.get_sys_cnt
-    which is marked Pure and gets eliminated by CSE, this op has a memory
-    read effect to prevent CSE from folding multiple calls into one.
-    Lowered to hivm.hir.get_sys_cnt in the ProtonToHIVM pass.
+    Reads the AICore system counter (GetSysCnt). Lowered to
+    hivm.get_sys_cnt in the ProtonToHIVM pass. A PipeBarrierOp(PIPE_S)
+    is inserted before each GetSysCntOp to prevent the VLIW scheduler
+    from bundling start/end counter reads in the same issue slot (which
+    would produce zero-duration entries for short scopes). PIPE_S only
+    stalls the scalar pipeline where GetSysCnt executes, much cheaper
+    than PIPE_ALL. GetSysCntOp also has MemoryEffects<[MemRead, MemWrite]>
+    to prevent CSE from merging multiple calls.
   }];
 
   let results = (outs I64:$result);

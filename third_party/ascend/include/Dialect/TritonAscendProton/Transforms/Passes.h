@@ -19,7 +19,7 @@ namespace proton {
 //===----------------------------------------------------------------------===//
 // Pass to lower Triton Ascend Proton ops to HIVM
 //===----------------------------------------------------------------------===//
-std::unique_ptr<Pass> createTritonAscendProtonToHIVMPass();
+std::unique_ptr<Pass> createTritonAscendProtonToHIVMPass(int32_t dataSegmentBytes = 4096);
 
 //===----------------------------------------------------------------------===//
 // Pass to lower ReadCycleCounterOp to GetSysCntOp (must run after CSE)

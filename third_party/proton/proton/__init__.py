@@ -7,4 +7,6 @@ from .profile import (
     finalize,
     profile,
     DEFAULT_PROFILE_NAME,
+    get_data_segment_bytes,
 )
+from .mode import Default, InstrumentationMode, BaseMode, Optimize

@@ -64,6 +64,16 @@ from triton.runtime import driver
 from triton.runtime.cache import get_dump_manager
 from triton.tools.get_ascend_devices import is_compile_on_910_95
 
+PROTON_DEFAULT_DATA_SEGMENT_BYTES = 4096
+
+
+def _get_proton_data_segment_bytes() -> int:
+    try:
+        from triton.profiler.proton import get_data_segment_bytes
+        return get_data_segment_bytes()
+    except (ImportError, AttributeError):
+        return PROTON_DEFAULT_DATA_SEGMENT_BYTES
+
 
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
@@ -159,7 +169,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             enable_select_analysis,
             compile_on_910_95
         )
-        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm)
+        proton_data_segment_bytes = _get_proton_data_segment_bytes()
+        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm, data_segment_bytes=proton_data_segment_bytes)
         ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm)
         pm.run(mod)
 
@@ -357,7 +368,8 @@ def _parse_proton_metadata(ttir: str, metadata: dict):
         return metadata
 
     unique_scopes = list(dict.fromkeys(scope_names))
-    proton_scratch_size = 4140
+    proton_data_segment_bytes = _get_proton_data_segment_bytes()
+    proton_scratch_size = 40 + 4 + proton_data_segment_bytes  # header + countVec + dataSegment
     proton_scope_names = ":".join(unique_scopes)
 
     metadata["proton_scratch_size"] = proton_scratch_size
