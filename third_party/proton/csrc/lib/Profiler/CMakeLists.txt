@@ -24,6 +24,7 @@ endif()
 if(PROTON_ENABLE_NPU)
 	list(APPEND PROFILER_SOURCES
 		Ascend/AscendProfiler.cpp
+		Ascend/AclProfParser.cpp
 		Instrumentation/AscendRuntime.cpp
 	)
 endif()

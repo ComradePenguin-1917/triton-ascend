@@ -43,11 +43,12 @@
 namespace {
 
 static constexpr int32_t kHeaderBytes = 40;   // 4*i32 + 3*i64
-static constexpr int32_t kTotalUnits = 1;     // AICore = 1 unit
+static constexpr int32_t kTotalUnits = 1;     // AICore = 1 unit per section
 static constexpr int32_t kCountVecBytes = kTotalUnits * 4;
 static constexpr int32_t kDefaultDataSegmentBytes = 4096;
 static constexpr int32_t kDefaultScratchMemSize =
     kHeaderBytes + kCountVecBytes + kDefaultDataSegmentBytes; // 4140
+static constexpr int32_t kDefaultNumSubBlocks = 1;
 static constexpr uint32_t kPreamble = 0xdeadbeef;
 
 static constexpr int32_t kOffPreamble = 0;
@@ -81,6 +82,8 @@ public:
       return mlir::success();
     }
 
+    detectSubBlocks();
+
     assignScopeIds(recordOps);
 
     if (failed(emitHeader())) {
@@ -107,14 +110,28 @@ private:
   mlir::Operation *funcOp{nullptr};
   int32_t dataSegmentBytes{kDefaultDataSegmentBytes};
   int32_t scratchMemSize{kDefaultScratchMemSize};
+  int32_t numSubBlocks{kDefaultNumSubBlocks};
   llvm::StringMap<uint32_t> scopeNameToId;
   llvm::SmallVector<std::string, 16> scopeNames;
   uint32_t numScopes{0};
   mlir::Value buffer;
-  // Per-block section offset (in i32 words): blockIdx * scratchMemSize / 4
-  // Each block writes to its own section of the proton buffer to avoid
-  // concurrent writes from multiple AICore blocks.
+  // Per-section offset (in i32 words): (blockIdx * numSubBlocks + subBlockIdx) * scratchMemSize / 4
+  // Each sub-block writes to its own section of the proton buffer to avoid
+  // concurrent writes from multiple AICore sub-blocks within the same block.
   mlir::Value sectionOffset;
+
+  void detectSubBlocks()
+  {
+    funcOp->walk([&](mlir::Operation *op) {
+      if (op->hasAttr("parallel_loop") ||
+          op->hasAttr("hivm.parallel_loop") ||
+          op->hasAttr("hfusion.bind_sub_block")) {
+        numSubBlocks = 2;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    });
+  }
 
   void assignScopeIds(mlir::ArrayRef<mlir::triton::proton::RecordOp> recordOps)
   {
@@ -169,15 +186,21 @@ private:
     auto zeroI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, i64Type);
     auto zeroI32 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, i32Type);
 
-    // Use GetBlockIdxOp for per-block section offset.
-    // TritonGlobalKernelArgsToHIVMOpPass will later replace program_id args
-    // with GetBlockIdxOp and erase the original args, so we cannot reference
-    // those args directly. GetBlockIdxOp survives that transformation.
+    // Use GetBlockIdxOp + GetSubBlockIdxOp for per-section offset.
+    // Each block * numSubBlocks + subBlockIdx gives a unique section index,
+    // so concurrent sub-blocks within the same block write to distinct sections.
     auto blockIdxI64 = builder.create<mlir::hivm::GetBlockIdxOp>(loc, i64Type);
+    auto subBlockIdxI64 = builder.create<mlir::hivm::GetSubBlockIdxOp>(loc, i64Type);
+    auto numSubBlocksI64 = builder.create<mlir::arith::ConstantIntOp>(
+        loc, static_cast<int64_t>(numSubBlocks), i64Type);
+    auto blockOffsetI64 = builder.create<mlir::arith::MulIOp>(
+        loc, blockIdxI64, numSubBlocksI64);
+    auto combinedIdxI64 = builder.create<mlir::arith::AddIOp>(
+        loc, blockOffsetI64, subBlockIdxI64);
     auto scratchWordsI64 = builder.create<mlir::arith::ConstantIntOp>(
         loc, static_cast<int64_t>(scratchMemSize / 4), i64Type);
     auto sectionOffI64 = builder.create<mlir::arith::MulIOp>(
-        loc, blockIdxI64, scratchWordsI64);
+        loc, combinedIdxI64, scratchWordsI64);
     auto indexType = builder.getIndexType();
     sectionOffset = builder.create<mlir::arith::IndexCastOp>(
         loc, indexType, sectionOffI64);
@@ -187,11 +210,10 @@ private:
     storeI32(builder, loc, preambleVal, kOffPreamble);
 
     auto blockIdVal = builder.create<mlir::arith::TruncIOp>(
-        loc, i32Type, blockIdxI64);
+        loc, i32Type, combinedIdxI64);
     storeI32(builder, loc, blockIdVal, kOffBlockId);
 
-    // On Ascend, each block runs on one AICore, so procId = blockIdx.
-    auto procIdVal = builder.create<mlir::arith::TruncIOp>(loc, i32Type, blockIdxI64);
+    auto procIdVal = builder.create<mlir::arith::TruncIOp>(loc, i32Type, combinedIdxI64);
     storeI32(builder, loc, procIdVal, kOffProcId);
 
     auto bufSizeVal = builder.create<mlir::arith::ConstantIntOp>(
@@ -305,9 +327,11 @@ private:
 
     auto scopeIdAttr = mlir::IntegerAttr::get(builder.getI32Type(), scopeId);
     auto isStartAttr = mlir::BoolAttr::get(ctx, isStart);
+    auto dataSegWordsAttr = mlir::IntegerAttr::get(builder.getI32Type(),
+        dataSegmentBytes / 4);
 
     builder.create<mlir::hivm::ProtonCircularStoreOp>(
-        loc, buffer, sectionOffset, cycle, scopeIdAttr, isStartAttr);
+        loc, buffer, sectionOffset, cycle, scopeIdAttr, isStartAttr, dataSegWordsAttr);
 
     op.erase();
     return mlir::success();
@@ -337,10 +361,14 @@ private:
         mlir::IntegerAttr::get(i32Type, numScopes));
     funcOp->setAttr(
         "proton_scratch_size",
-        mlir::IntegerAttr::get(i32Type, scratchMemSize));
+        mlir::IntegerAttr::get(i32Type, scratchMemSize * numSubBlocks));
     funcOp->setAttr(
         "proton_total_units",
         mlir::IntegerAttr::get(i32Type, kTotalUnits));
+
+    funcOp->setAttr(
+        "proton_num_sub_blocks",
+        mlir::IntegerAttr::get(i32Type, numSubBlocks));
   }
 };
 

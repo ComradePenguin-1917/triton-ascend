@@ -10,6 +10,7 @@
 #endif
 #ifdef PROTON_ENABLE_NPU
 #include "Profiler/Instrumentation/AscendRuntime.h"
+#include <acl/acl.h>
 #endif
 #include "Utility/Numeric.h"
 #include "Utility/String.h"
@@ -197,8 +198,9 @@ void InstrumentationProfiler::enterInstrumentedOp(uint64_t streamId,
 }
 
 void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
-                                                 uint64_t functionId,
-                                                 uint8_t *buffer, size_t size) {
+                                                  uint64_t functionId,
+                                                  uint8_t *buffer, size_t size,
+                                                  bool isHost) {
   if (!buffer || !hostBuffer)
     return;
 
@@ -221,7 +223,7 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
   auto dataSet = getDataSet();
   const auto &functionName = functionNames[functionId];
   if (dataScopeIdMap.empty()) {
-    for (auto &data : dataSet) {
+    for (auto *data : dataSet) {
       auto scopeId = Scope::getNewScopeId();
       data->addOp(scopeId, functionName);
       dataScopeIdMap[data] = scopeId;
@@ -245,43 +247,54 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
   }
   auto &scopeIdContexts = functionScopeIdContexts[functionId];
 
-  runtime->synchronizeStream(reinterpret_cast<void *>(streamId));
-  runtime->processHostBuffer(
-      hostBuffer, size, buffer, size, priorityStream,
-      [&](uint8_t *bufferPtr, size_t size) {
-        ByteSpan byteSpan(bufferPtr, size);
-        CircularLayoutParser parser(byteSpan, *circularLayoutConfig);
-        try {
-          parser.parse();
-        } catch (const std::exception &e) {
-          return;
-        }
-        auto result = parser.getResult();
-        for (auto &blockTrace : parser.getResult()->blockTraces) {
-          for (auto &trace : blockTrace.traces) {
-            for (auto &event : trace.profileEvents) {
-              auto &contexts = scopeIdContexts[event.first->scopeId];
-              auto duration = event.second->cycle - event.first->cycle;
-              auto normalizedDuration = static_cast<double>(duration) /
-                                        (circularLayoutConfig->totalUnits *
-                                         circularLayoutConfig->numBlocks);
-              for (auto *data : dataSet) {
-                auto kernelId = dataScopeIdMap[data];
-                auto scopeId = data->addOp(kernelId, contexts);
-                data->addMetric(
-                    scopeId,
-                    std::make_shared<CycleMetric>(
-                        event.first->cycle, event.second->cycle, duration,
-                        normalizedDuration, kernelId, functionName,
-                        blockTrace.blockId, blockTrace.procId, trace.uid,
-                        device, static_cast<uint64_t>(runtime->getDeviceType()),
-                        timeShiftCost, blockTrace.initTime,
-                        blockTrace.preFinalTime, blockTrace.postFinalTime));
-              }
-            }
+  auto parseBuffer = [&](uint8_t *bufPtr, size_t bufSize) {
+    ByteSpan byteSpan(bufPtr, bufSize);
+    CircularLayoutParser parser(byteSpan, *circularLayoutConfig);
+    try {
+      parser.parse();
+    } catch (const std::exception &e) {
+      return;
+    }
+    auto result = parser.getResult();
+    for (auto &blockTrace : result->blockTraces) {
+      for (auto &trace : blockTrace.traces) {
+        for (auto &event : trace.profileEvents) {
+          auto &contexts = scopeIdContexts[event.first->scopeId];
+          auto duration = event.second->cycle - event.first->cycle;
+          auto normalizedDuration = static_cast<double>(duration) /
+                                    (circularLayoutConfig->totalUnits *
+                                     circularLayoutConfig->numBlocks);
+          for (auto *data : dataSet) {
+            auto kernelId = dataScopeIdMap[data];
+            auto scopeId = data->addOp(kernelId, contexts);
+            data->addMetric(
+                scopeId,
+                std::make_shared<CycleMetric>(
+                    event.first->cycle, event.second->cycle, duration,
+                    normalizedDuration, kernelId, functionName,
+                    blockTrace.blockId, blockTrace.procId, trace.uid,
+                    device, static_cast<uint64_t>(runtime->getDeviceType()),
+                    timeShiftCost, blockTrace.initTime,
+                    blockTrace.preFinalTime, blockTrace.postFinalTime));
           }
         }
-      });
+      }
+    }
+  };
+
+  if (isHost) {
+    parseBuffer(buffer, size);
+#ifdef PROTON_ENABLE_NPU
+    aclrtFreeHost(buffer);
+#endif
+  } else {
+    runtime->synchronizeStream(reinterpret_cast<void *>(streamId));
+    runtime->processHostBuffer(
+        hostBuffer, size, buffer, size, priorityStream,
+        [&](uint8_t *bufferPtr, size_t chunkSize) {
+          parseBuffer(bufferPtr, chunkSize);
+        });
+  }
 
   dataScopeIdMap.clear();
 }

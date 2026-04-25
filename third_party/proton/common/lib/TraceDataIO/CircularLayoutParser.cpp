@@ -26,12 +26,7 @@ void CircularLayoutParser::parse() {
   uint32_t pos = buffer.position();
   for (int i = 0; i < numBlocks; i++) {
     buffer.seek(pos);
-    try {
-      parseBlock();
-    } catch (const ParserException &e) {
-      // Skip corrupted blocks and continue parsing remaining blocks.
-      // Partial traces from valid blocks are still usable.
-    }
+    parseBlock();
     pos += scratchMemSize;
   }
 }
@@ -162,7 +157,7 @@ ScopeMisMatchException::ScopeMisMatchException(const std::string &msg)
     : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 ClockOverflowException::ClockOverflowException(const std::string &msg)
-    : ParserException(msg, ExceptionSeverity::ERROR) {}
+    : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 namespace {
 Device decodeDevice(const uint32_t dev) {

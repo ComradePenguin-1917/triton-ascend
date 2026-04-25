@@ -62,8 +62,20 @@ def get_min_time_flops(df, device_info):
                         max_flops = 383e12 / (width / 8)
                     elif arch == "gfx941" or arch == "gfx942":
                         max_flops = 2614.9e12 / (width / 8)
+                elif device_type == "ASCEND":
+                    aic_mac_per_cycle = 4096
+                    flops_per_cycle = num_sms * aic_mac_per_cycle * 2
+                    peak_flops_fp16 = flops_per_cycle * clock_rate * 1e3
+                    if width <= 16:
+                        max_flops = peak_flops_fp16
+                    elif width == 32:
+                        max_flops = peak_flops_fp16 / 2
+                    elif width == 64:
+                        max_flops = peak_flops_fp16 / 4
+                    else:
+                        max_flops = peak_flops_fp16
                 else:
-                    raise ValueError(f"Unsupported device type: {device_type}")
+                    continue
                 min_time_flops.loc[idx, "min_time"] += device_frames[f"flops{width}"].fillna(0) / max_flops
     return min_time_flops
 

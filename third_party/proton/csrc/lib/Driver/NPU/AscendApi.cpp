@@ -51,22 +51,31 @@ proton::Device getDevice(uint64_t index) {
   aclrtUtilizationInfo utilizationInfo = {0};
   aclError utilRet = aclrtGetDeviceUtilizationRate(index, &utilizationInfo);
   
-  // Legacy CUDA/HIP fields - Not applicable for Ascend
-  uint64_t clockRate = 0;          // Not available via ACL API
-  uint64_t memoryClockRate = 0;    // Not available via ACL API  
-  uint64_t busWidth = 0;            // Not available via ACL API
-  uint64_t numSms = 0;              // AI Core count (inferred from SOC)
-  
-  // ----------------------------------------------------------------------------
-  // Infer AI Core count from SOC architecture
-  // ----------------------------------------------------------------------------
-  if (arch.find("910") != std::string::npos) {
-    numSms = 32;  // Ascend 910 series: all variants have 32 AI Cores
-  } else if (arch.find("310P") != std::string::npos || 
-             arch.find("310p") != std::string::npos) {
-    numSms = 8;   // Ascend 310P series: 8 AI Cores
+  uint64_t clockRate = 0;
+  uint64_t memoryClockRate = 0;
+  uint64_t busWidth = 0;
+  uint64_t numSms = 0;
+
+  if (arch.find("910B") != std::string::npos || arch.find("910b") != std::string::npos) {
+    numSms = 32;
+    clockRate = 1800000;
+    memoryClockRate = 1600000;
+    busWidth = 4096;
+  } else if (arch.find("910") != std::string::npos) {
+    numSms = 32;
+    clockRate = 1800000;
+    memoryClockRate = 1600000;
+    busWidth = 4096;
+  } else if (arch.find("310P") != std::string::npos || arch.find("310p") != std::string::npos) {
+    numSms = 8;
+    clockRate = 1500000;
+    memoryClockRate = 1066000;
+    busWidth = 2048;
   } else if (arch.find("310") != std::string::npos) {
-    numSms = 8;   // Ascend 310: 8 AI Cores
+    numSms = 8;
+    clockRate = 1000000;
+    memoryClockRate = 800000;
+    busWidth = 1024;
   }
   
   // Create device with legacy fields

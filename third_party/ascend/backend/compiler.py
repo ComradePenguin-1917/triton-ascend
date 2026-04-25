@@ -121,58 +121,82 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         auto_blockify_size = metadata["auto_blockify_size"]
         if not _is_auto_map_parallel_blocks_enabled():
             auto_blockify_size = 1
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         ascend.passes.ttir.add_auto_blockify(
             pm,
             auto_blockify_size
         )
-        if (metadata["add_auto_scheduling"]):
-            ascend.passes.ttir.add_dag_sync(pm)
-            ascend.passes.ttir.add_dag_scope(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
-            ascend.passes.ttir.add_dag_ssbuffer(pm)
-            passes.common.add_cse(pm)
-            passes.common.add_canonicalizer(pm)
+        pm.run(mod)
 
+        if (metadata["add_auto_scheduling"]):
+            pm2 = ir.pass_manager(mod.context)
+            pm2.enable_debug()
+            ascend.passes.ttir.add_dag_sync(pm2)
+            ascend.passes.ttir.add_dag_scope(pm2)
+            passes.common.add_cse(pm2)
+            passes.common.add_canonicalizer(pm2)
+            ascend.passes.ttir.add_dag_ssbuffer(pm2)
+            passes.common.add_cse(pm2)
+            passes.common.add_canonicalizer(pm2)
+            pm2.run(mod)
+
+        pm3 = ir.pass_manager(mod.context)
+        pm3.enable_debug()
         ascend.passes.ttir.add_triton_to_structure(
-            pm,
+            pm3,
             enable_mask_fallback_conversion,
             optimize_dynamic_offset
         )
         ascend.passes.ttir.add_discrete_mask_access_conversion(
-            pm,
+            pm3,
             compile_on_910_95,
             force_simt_template
         )
-        ascend.passes.ttir.add_triton_to_annotation(pm)
+        pm3.run(mod)
+
+        pm4 = ir.pass_manager(mod.context)
+        pm4.enable_debug()
+        ascend.passes.ttir.add_triton_to_annotation(pm4)
+        pm4.run(mod)
+
+        pm5 = ir.pass_manager(mod.context)
+        pm5.enable_debug()
         ascend.passes.ttir.add_triton_to_unstructure(
-            pm,
+            pm5,
             compile_on_910_95,
             force_simt_template
         )
-        ascend.passes.ttir.add_triton_to_hivm(pm)
-        ascend.passes.ttir.add_triton_to_hfusion(pm)
-        ascend.passes.ttir.add_triton_to_llvm(pm)
-        ascend.passes.ttir.add_bubble_up_operation(pm)
+        ascend.passes.ttir.add_triton_to_hivm(pm5)
+        ascend.passes.ttir.add_triton_to_hfusion(pm5)
+        ascend.passes.ttir.add_triton_to_llvm(pm5)
+        ascend.passes.ttir.add_bubble_up_operation(pm5)
+        pm5.run(mod)
+
+        pm6 = ir.pass_manager(mod.context)
+        pm6.enable_debug()
         ascend.passes.ttir.add_triton_to_structure(
-            pm,
+            pm6,
             enable_mask_fallback_conversion,
             optimize_dynamic_offset
         )
         ascend.passes.ttir.add_triton_to_linalg(
-            pm,
+            pm6,
             False,
             named_ops,
             enable_nd2nz_on_vector,
             enable_select_analysis,
             compile_on_910_95
         )
+        pm6.run(mod)
+
+        pm7 = ir.pass_manager(mod.context)
+        pm7.enable_debug()
         proton_data_segment_bytes = _get_proton_data_segment_bytes()
-        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm, data_segment_bytes=proton_data_segment_bytes)
-        ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm)
-        pm.run(mod)
+        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm7, data_segment_bytes=proton_data_segment_bytes)
+        ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm7)
+        pm7.run(mod)
 
         # Extract proton profiling attributes from the lowered function.
         mod_str = str(mod)
@@ -183,6 +207,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             total_units_match = re.search(r'proton_total_units\s*=\s*(\d+)', mod_str)
             if total_units_match:
                 metadata["proton_total_units"] = int(total_units_match.group(1))
+            num_sub_blocks_match = re.search(r'proton_num_sub_blocks\s*=\s*(\d+)', mod_str)
+            if num_sub_blocks_match:
+                metadata["proton_num_sub_blocks"] = int(num_sub_blocks_match.group(1))
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -369,15 +396,20 @@ def _parse_proton_metadata(ttir: str, metadata: dict):
 
     unique_scopes = list(dict.fromkeys(scope_names))
     proton_data_segment_bytes = _get_proton_data_segment_bytes()
-    proton_scratch_size = 40 + 4 + proton_data_segment_bytes  # header + countVec + dataSegment
+    proton_per_section_size = 40 + 4 + proton_data_segment_bytes  # header + countVec + dataSegment
     proton_scope_names = ":".join(unique_scopes)
 
-    metadata["proton_scratch_size"] = proton_scratch_size
+    has_sub_blocks = "parallel_loop" in ttir or "bind_sub_block" in ttir
+    num_sub_blocks = 2 if has_sub_blocks else 1
+
+    metadata["proton_scratch_size"] = proton_per_section_size * num_sub_blocks
+    metadata["proton_num_sub_blocks"] = num_sub_blocks
+    metadata["proton_per_section_size"] = proton_per_section_size
     metadata["proton_scope_names"] = proton_scope_names
     metadata["proton_function_id"] = int(metadata["hash"][:16], 16)
 
     metadata_json = {
-        "profile_scratch_size": proton_scratch_size,
+        "profile_scratch_size": proton_per_section_size,
         "num_warps": 1,
     }
     proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
@@ -1048,6 +1080,7 @@ class AscendBackend(BaseBackend):
         pss = getattr(metadata, 'proton_scratch_size', None)
         pfid = getattr(metadata, 'proton_function_id', None)
         psn = getattr(metadata, 'proton_scope_names', None)
+        pnsb = getattr(metadata, 'proton_num_sub_blocks', None)
         return {
             "kernel_name": kernel_name,
             "hash": metadata.hash,
@@ -1056,6 +1089,7 @@ class AscendBackend(BaseBackend):
             "proton_scratch_size": pss,
             "proton_function_id": pfid,
             "proton_scope_names": psn,
+            "proton_num_sub_blocks": pnsb,
         }
 
     def get_codegen_implementation(self):

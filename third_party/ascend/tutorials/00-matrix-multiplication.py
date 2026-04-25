@@ -190,7 +190,7 @@ def matmul(a, b, activation=""):
 
     tmp_path = pathlib.Path(os.getcwd())
     temp_file = tmp_path / "matmul.json"
-    proton.start(str(temp_file.with_suffix("")), backend="npu")
+    proton.start(str(temp_file.with_suffix("")), data="trace", backend="instrumentation")
     matmul_kernel[grid](
         a,
         b,

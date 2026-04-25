@@ -277,13 +277,13 @@ void SessionManager::enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
 }
 
 void SessionManager::exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                                        uint8_t *buffer, size_t size) {
+                                        uint8_t *buffer, size_t size, bool isHost) {
   std::lock_guard<std::mutex> lock(mutex);
   executeInterface(
       instrumentationInterfaceCounts,
       [&](auto *instrumentationInterface) {
         instrumentationInterface->exitInstrumentedOp(streamId, functionId,
-                                                     buffer, size);
+                                                     buffer, size, isHost);
       },
       /*isReversed=*/true);
 }

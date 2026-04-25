@@ -16,7 +16,9 @@ include "TritonAscendProtonAttrDefs.td"
 // Record Operation - Compatible with original Proton
 //===----------------------------------------------------------------------===//
 
-def TritonAscendProton_RecordOp : TritonAscendProton_Op<"record", []> {
+def TritonAscendProton_RecordOp : TritonAscendProton_Op<"record", [
+  MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+]> {
   let summary = "Record an event for Ascend NPU profiling";
   
   let description = [{
@@ -150,7 +152,8 @@ def TritonAscendProton_MultibufferOp : TritonAscendProton_Op<"multibuffer", []> 
 
 def TritonAscendProton_ReadCycleCounterOp
     : TritonAscendProton_Op<"read_cycle_counter",
-      [MemoryEffects<[MemRead]>]> {
+      [MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+      ]> {
   let summary = "Read Ascend AICore cycle counter";
 
   let description = [{

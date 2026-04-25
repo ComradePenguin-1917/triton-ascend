@@ -165,8 +165,10 @@ class NPULauncher(object):
                         if not proton_metadata_path or not os.path.exists(proton_metadata_path):
                             proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
                             proton_metadata_path = os.path.join(proton_tmpdir, "proton_metadata.json")
+                            num_sub_blocks = metadata.get('proton_num_sub_blocks', 1)
+                            per_section_size = proton_scratch_size // num_sub_blocks if num_sub_blocks > 1 else proton_scratch_size
                             metadata_json = {
-                                "profile_scratch_size": proton_scratch_size,
+                                "profile_scratch_size": per_section_size,
                                 "num_warps": 1,
                             }
                             with open(proton_metadata_path, "w") as f:
@@ -196,11 +198,16 @@ class NPULauncher(object):
         if proton_scratch_size > 0 and proton_function_id is not None:
             try:
                 from triton._C.libproton import proton as libproton
-                proton_buf_ptr = metadata.get('_proton_buffer_ptr', 0)
+                # Prefer host buffer (already copied in _launch before
+                # proton_buf_tensor was destroyed) over the stale device
+                # pointer to avoid use-after-free.
+                proton_host_buf_ptr = metadata.get('_proton_host_buffer_ptr', 0)
+                buffer_ptr = proton_host_buf_ptr if proton_host_buf_ptr else metadata.get('_proton_buffer_ptr', 0)
+                is_host = 1 if proton_host_buf_ptr else 0
                 proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
                 stream = args[3]
                 stream_id = stream if isinstance(stream, int) else 0
-                libproton.exit_instrumented_op(stream_id, proton_function_id, proton_buf_ptr, proton_buf_size)
+                libproton.exit_instrumented_op(stream_id, proton_function_id, buffer_ptr, proton_buf_size, is_host)
             except Exception:
                 pass
 
@@ -919,7 +926,23 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}
    }};
    {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
-  return;
+   {''
+   '// Copy proton profiling data from device to host while proton_buf_tensor'
+   '// is still alive. Without this, exit_instrumented_op would read freed'
+   '// device memory after proton_buf_tensor is destroyed at function return.'
+   'if (proton_buf_ptr != NULL && protonBufSize > 0) {'
+   '  uint8_t *proton_host_buf = NULL;'
+   '  aclError proton_copy_ret = aclrtMallocHost(reinterpret_cast<void**>(&proton_host_buf), protonBufSize);'
+   '  if (proton_copy_ret == ACL_ERROR_NONE && proton_host_buf != NULL) {'
+   '    proton_copy_ret = aclrtMemcpy(proton_host_buf, protonBufSize, proton_buf_ptr, protonBufSize, ACL_MEMCPY_DEVICE_TO_HOST);'
+   '    if (proton_copy_ret == ACL_ERROR_NONE) {'
+   '      PyDict_SetItemString(packedMetadata, "_proton_host_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_host_buf)));'
+   '    } else {'
+   '      aclrtFreeHost(proton_host_buf);'
+   '    }'
+   '  }'
+   '}' if proton_scratch_size > 0 and not enable_taskqueue else ''}
+   return;
 }}
 
 // Extract tensor shape from PyObject

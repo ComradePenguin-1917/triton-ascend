@@ -11,6 +11,12 @@ set(ASCENDNPU_IR_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/AscendNPU-IR")
 set(BISHENGIR_ENABLE_A5_UNPUBLISHED_FEATURES ON)
 set(BISHENGIR_BUILD_STANDALONE_IR_ONLY ON)
 
+# Triton-ascend uses LLVM 20.0.0git, so enable the corresponding compatibility
+# defines so that AscendNPU-IR (bishengir) picks the correct API variants.
+# NOTE: Only LLVM_MAJOR_VERSION_20_COMPATIBLE is enabled, NOT 21, because
+# some APIs (e.g. concatAffineMaps) changed between LLVM 20 and 21.
+set(LLVM_MAJOR_VERSION_20_COMPATIBLE ON)
+
 add_subdirectory(${ASCENDNPU_IR_SRC_DIR} ${ASCENDNPU_IR_BINARY_DIR})
 include_directories(${ASCENDNPU_IR_SRC_DIR}/bishengir/include)
 include_directories(${ASCENDNPU_IR_BINARY_DIR}/bishengir/include) # Tablegen'd files

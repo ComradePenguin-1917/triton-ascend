@@ -87,9 +87,9 @@ static void initProton(pybind11::module &&m) {
   });
 
   m.def("exit_instrumented_op", [](uint64_t streamId, uint64_t functionId,
-                                   uint64_t buffer, size_t size) {
+                                    uint64_t buffer, size_t size, bool isHost) {
     SessionManager::instance().exitInstrumentedOp(
-        streamId, functionId, reinterpret_cast<uint8_t *>(buffer), size);
+        streamId, functionId, reinterpret_cast<uint8_t *>(buffer), size, isHost);
   });
 
   m.def("enter_state", [](const std::string &state) {

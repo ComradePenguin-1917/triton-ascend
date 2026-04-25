@@ -112,7 +112,7 @@ public:
                            uint8_t *buffer, size_t size);
 
   void exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                          uint8_t *buffer, size_t size);
+                           uint8_t *buffer, size_t size, bool isHost = false);
 
   void addMetrics(size_t scopeId,
                   const std::map<std::string, MetricValueType> &metrics);
