@@ -2,23 +2,11 @@
 
 ## Introduction
 
-Proton is a lightweight profiler for Triton, designed to be used for code written in Python and to invoke underlying GPU kernels. Proton provides insightful information about the program context, metadata, and hardware performance metrics of the GPU kernels invoked.
+Proton is a lightweight profiler for Triton, designed to be used for code written in Python and to invoke underlying GPU/NPU kernels. Proton provides insightful information about the program context, metadata, and hardware performance metrics of the GPU/NPU kernels invoked.
 
 ## Installation
 
-The following command installs the latest version of Proton.
-
-```bash
-git clone https://github.com/triton-lang/triton
-cd triton/python
-pip install .
-```
-
-To **not build** Proton, you can set the `TRITON_BUILD_PROTON` environment variable to `OFF`:
-
-```bash
-TRITON_BUILD_PROTON=OFF pip install .
-```
+Proton is built as part of Triton-Ascend. Follow the [installation guide](../../docs/en/installation_guide.md) to build from source with Proton enabled (default).
 
 ## Usage
 
@@ -122,7 +110,6 @@ bytes: int  # The number of bytes expected to be transferred
 ### Command line
 
 Proton can be used as a command-line tool to profile Python scripts and Pytest tests.
-The following examples demonstrate how to use Proton command-line.
 
 ```bash
 proton [options] script.py [script_args] [script_options]
@@ -131,6 +118,8 @@ python -m triton.profiler.proton [options] script.py [script_args] [script_optio
 ```
 
 When profiling in the command line mode, the `proton.start` and `proton.finalize` functions are automatically called before and after the script execution. Any `proton.start` and `proton.finalize` functions in the script are ignored. Also, in the command line mode, only a single *session* is supported. Therefore, `proton.deactivate(session_id=1)` is invalid, while `proton.deactivate(session_id=0)` is valid.
+
+Note: The `proton` CLI tool is not available in the current Triton-Ascend build. Use the Python API (`proton.start` / `proton.finalize`) instead.
 
 ### Visualizing the profile data
 
@@ -149,67 +138,89 @@ More options can be found by running the following command.
 proton-viewer -h
 ```
 
-### Instruction sampling (experimental)
+### Ascend NPU Backends
 
-Proton supports instruction sampling on NVIDIA GPUs.
-Please note that this is an experimental feature and may not work on all GPUs.
-You may experience ~20x end-to-end overhead when using instruction sampling, although the overhead for each individual GPU kernel is negligible.
-The overhead is mostly caused by data transfer and processing on the CPU.
-Additionally, the proton-viewer options `-i <regex> -d <depth> -t <threshold>` can be helpful for filtering out GPU kernels that are not of interest.
-The following example demonstrates how to use instruction sampling:
+Proton supports two profiling backends on Ascend NPU: **instrumentation** and **npu-native**.
+
+#### Instrumentation Mode
+
+The instrumentation mode uses Triton's built-in instrumentation to profile kernel execution with per-warp granularity. It is the default backend when running on Ascend NPU (auto-detected).
+
+```python
+import triton.profiler as proton
+from triton.profiler import Default
+
+# Auto-detected: uses instrumentation mode on Ascend
+proton.start(name="profile_name", context="shadow")
+
+# Explicit: specify backend="npu" (same as auto-detection)
+proton.start(name="profile_name", context="shadow", backend="npu")
+
+# Or use the generic backend name "instrumentation"
+proton.start(name="profile_name", context="shadow", backend="instrumentation")
+
+# With mode options: buffer_size, sample_every_n
+proton.start(name="profile_name", context="shadow", backend="npu",
+             mode=Default(buffer_size=8192, sample_every_n=4))
+```
+
+The instrumentation mode supports the following options via `InstrumentationMode`:
+
+- `buffer_size` (int): Per-kernel profiling buffer size in bytes. 0 means default (4096). Increase for kernels with many scopes to avoid overflow (see Known Issues).
+- `optimizations` (List[Optimize]): Optimization flags. Currently, only `time_shift` is implemented on Ascend (compensates for `GetSysCntOp` + `PipeBarrier` overhead, ~12 cycles on AI Core). The other flags are defined in the API but not yet implemented.
+- `sample_every_n` (int): Profile every N-th block. 1 = all blocks (default), 2 = every 2nd block, etc. Reduces profiling memory and overhead for large grids.
+
+#### NPU-Native Mode
+
+The npu-native mode uses the Ascend ACL profiling API (`aclprofInit/Start/Stop`) to collect kernel execution time and AI Core/Vector hardware metrics from CANN profiling data.
 
 ```python
 import triton.profiler as proton
 
-proton.start(name="profile_name", context="shadow", backend="cupti_pcsampling")
+proton.start(name="profile_name", context="shadow", backend="npu-native")
 ```
 
-## Proton *vs* nsys
+The npu-native mode collects the following hardware metrics for each kernel (when available):
 
-- Runtime overhead (up to 1.5x)
+| Metric | Description |
+|--------|-------------|
+| `aic_mac_ratio` | AI Core MAC unit utilization ratio |
+| `aic_scalar_ratio` | AI Core Scalar unit utilization ratio |
+| `aic_mte1_ratio` | AI Core MTE1 (memory transfer engine 1) ratio |
+| `aic_mte2_ratio` | AI Core MTE2 (memory transfer engine 2) ratio |
+| `aic_fixpipe_ratio` | AI Core FixPipe utilization ratio |
+| `aic_icache_miss_rate` | AI Core instruction cache miss rate |
+| `aiv_vec_ratio` | AI Vector compute unit utilization ratio |
+| `aiv_scalar_ratio` | AI Vector scalar unit utilization ratio |
+| `aiv_mte1_ratio` | AI Vector MTE1 ratio |
+| `aiv_mte2_ratio` | AI Vector MTE2 ratio |
+| `aiv_mte3_ratio` | AI Vector MTE3 ratio |
+| `aiv_icache_miss_rate` | AI Vector instruction cache miss rate |
 
-Proton has a lower profiling overhead than nsys. Even for workload with a large number of small GPU kernels, proton triggers less than ~1.5x overhead.
+You can configure the output path for profiling data via the `PROTON_ASCEND_OUTPUT_PATH` environment variable (default: `/tmp/ascend_profiling`):
 
-For GPU-bound workload, both proton and nsys has similar overhead, with little impact on the workload.
-
-The lower overhead of proton is due to its less profiling metrics and callbacks compared to nsys.
-
-- Profile size (significantly smaller than nsys)
-
-nsys traces and records every GPU kernel, while proton aggregates the metrics of GPU kernels under the same calling context.
-
-As a result, proton's profile size can be up to thousands of times smaller than nsys's profile size, depending on the running time.
-
-- Portability (support different GPUs)
-
-Proton is designed to be portable and can be used on AMD GPUs. nsys only supports NVIDIA GPUs.
-
-- Insights (more insightful than nsys on triton kernels)
-
-Proton can register hooks to analyze the metadata of triton kernels, while nsys cannot. **Note** that the hooks do add additional overhead to proton.
-
-## Proton *vs* ncu
-
-Similar to the comparison between Proton and Nsight Systems (Nsys), Proton has a lower profiling overhead than Nsight Compute (NCU). We also plan to support instruction sampling on AMD GPUs.
-However, Nsight Compute supports the collection of more detailed metrics than Proton, such as memory access patterns, memory transactions, and other instruction-level metrics.
-In contrast, Proton only supports instruction sampling and is designed to be lightweight and portable.
+```bash
+PROTON_ASCEND_OUTPUT_PATH=/data/profiling_output python your_script.py
+```
 
 ## Known issues
 
-- CUDA graph
+- Ascend NPU profiling output path
 
-`hooks` cannot be used to accurately accumulate the number of FLOPs in CUDA graph mode profiling because kernels are captured and launched separately; metrics are not accumulated when kernels are launched in graph mode. This issue can be circumvented by using `scope` to supply FLOPs.
+The npu-native mode stores profiling data in the directory specified by `PROTON_ASCEND_OUTPUT_PATH` (default: `/tmp/ascend_profiling`). Ensure the directory exists and has sufficient disk space before profiling.
 
-If profiling is initiated after CUDA graph capturing, there may be minor memory leak issues.
-This is because the number of kernels in a graph instance (i.e., `cuGraphExec`) is unknown, preventing the deletion of mappings between the kernel ID and the graph ID.
+- Ascend NPU msprof dependency
 
-- Instruction sampling
+The npu-native mode requires CANN toolkit to be installed and `ASCEND_HOME_PATH` or `ASCEND_TOOLKIT_HOME` environment variable to be set for msprof data import. Without this, kernel names may not be resolved and hardware metrics may be unavailable.
 
-If you encounter permission related problems when using instruction sampling, you can lookup this [page](https://developer.nvidia.com/nvidia-development-tools-solutions-err_nvgpuctrperm-permission-issue-performance-counters) for help.
+- Visible devices on Ascend NPUs
 
-The overhead of instruction sampling on NVIDIA GPUs is about 20x using Proton because we haven't enabled continuous sampling yet.
-Continuous sampling can allow for more runtime optimizations, but it makes it more challenging to attribute performance data back to the GPU kernels because: (1) it enables profiling of concurrent kernels, (2) it doesn't allow profiling of time and instruction samples simultaneously, and (3) it works best if we have a separate thread dedicated to attributing instruction samples to the GPU kernels
+Environment variables `ASCEND_RT_VISIBLE_DEVICES` is recommended to control device visibility on Ascend NPUs. Using `CUDA_VISIBLE_DEVICES` or other non-Ascend device environment variables may cause unexpected behavior.
 
-- Visible devices on AMD GPUs
+- Ascend NPU instrumentation mode: buffer overflow may cause partial data loss
 
-Environment variables such as `HIP_VISIBLE_DEVICES`, and `CUDA_VISIBLE_DEVICES` are not supported on AMD GPUs. Once it's set, we cannot find a valid mapping between the device ID returned by RocTracer and the physical device ID. Instead, `ROCR_VISIBLE_DEVICES` is recommended to be used.
+On Ascend NPU, when the circular profiling buffer overflows (i.e., the number of profiling events exceeds the per-warp buffer capacity of `buffer_size / 8`), a hardware errata may cause corrupted preambles in some CTA blocks (~30% affected). This results in fewer trace events than expected. If needed, please increase `buffer_size` to prevent overflow.
+
+- Ascend NPU instrumentation mode: same-process multi-configuration not supported
+
+Due to an Ascend driver limitation (`rtFunctionRegister` does not support re-registering a new binary with the same kernel symbol name), running multiple profiling sessions with different configurations (e.g., different `buffer_size` or `sample_every_n`) in the same process may cause incorrect results. Please run each configuration in a separate process or script invocation.

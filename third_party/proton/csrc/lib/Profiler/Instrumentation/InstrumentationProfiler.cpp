@@ -42,12 +42,15 @@ void InstrumentationProfiler::doFlush() {
 
 void InstrumentationProfiler::doStop() {
   // Stop the instrumentation profiler.
-  // FIXME: Also we should ensure the context is valid before releasing the
-  // memory
   if (hostBuffer != nullptr) {
     runtime->freeHostBuffer(hostBuffer);
     hostBuffer = nullptr;
   }
+  // Reset accumulated state to prevent cross-session pollution.
+  functionScopeIdNames.clear();
+  functionScopeIdContexts.clear();
+  functionNames.clear();
+  functionMetadata.clear();
 }
 
 void InstrumentationProfiler::doSetMode(

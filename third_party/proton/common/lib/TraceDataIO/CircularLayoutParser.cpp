@@ -151,7 +151,7 @@ void CircularLayoutParser::parseBlock() {
 }
 
 PreambleException::PreambleException(const std::string &msg)
-    : ParserException(msg, ExceptionSeverity::ERROR) {}
+    : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 ScopeMisMatchException::ScopeMisMatchException(const std::string &msg)
     : ParserException(msg, ExceptionSeverity::WARNING) {}

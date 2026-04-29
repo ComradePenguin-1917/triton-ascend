@@ -3,7 +3,7 @@
 //
 // Buffer layout (i32 words):
 //   [0]     preamble      = 0xdeadbeef
-//   [1]     blockId       = 0
+//   [1]     blockId       (original blockIdx * numSubBlocks + subBlockIdx)
 //   [2]     procId        = 0
 //   [3]     bufSize       (data segment size in bytes)
 //   [4-5]   initTime      (i64, GetSysCnt at function entry)
@@ -12,9 +12,9 @@
 //   [10]    countVec[0]   (word count written by unit 0)
 //   [11+]   dataSegment   (CycleEntry records, 2 words each)
 //
-// CycleEntry encoding (2 x i32, 8 bytes):
-//   word0 = (isStart?0:0x80000000) | (scopeId<<23) | ((cycle>>32)&0x7FF)
-//   word1 = cycle & 0xFFFFFFFF
+// When block_sample_ratio > 1, only blocks where blockIdx % ratio == 0
+// write profiling data. The buffer is allocated for sampled blocks only,
+// and section offsets use slotIdx = blockIdx / ratio instead of blockIdx.
 //===----------------------------------------------------------------------===//
 
 #include "ascend/include/Dialect/TritonAscendProton/Transforms/Passes.h"
@@ -25,6 +25,7 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -49,6 +50,7 @@ static constexpr int32_t kDefaultDataSegmentBytes = 4096;
 static constexpr int32_t kDefaultScratchMemSize =
     kHeaderBytes + kCountVecBytes + kDefaultDataSegmentBytes; // 4140
 static constexpr int32_t kDefaultNumSubBlocks = 1;
+static constexpr int32_t kDefaultBlockSampleRatio = 1;
 static constexpr uint32_t kPreamble = 0xdeadbeef;
 
 static constexpr int32_t kOffPreamble = 0;
@@ -67,9 +69,11 @@ static constexpr uint32_t kCycleUpperMask = 0x7FFu;
 
 class ProtonRecordConverter {
 public:
-  ProtonRecordConverter(mlir::Operation *funcOp, int32_t dataSegBytes)
+  ProtonRecordConverter(mlir::Operation *funcOp, int32_t dataSegBytes,
+                        int32_t blockSampleRatio = kDefaultBlockSampleRatio)
       : funcOp(funcOp), dataSegmentBytes(dataSegBytes),
-        scratchMemSize(kHeaderBytes + kCountVecBytes + dataSegBytes) {}
+        scratchMemSize(kHeaderBytes + kCountVecBytes + dataSegBytes),
+        blockSampleRatio(blockSampleRatio) {}
 
   mlir::LogicalResult convert()
   {
@@ -111,14 +115,18 @@ private:
   int32_t dataSegmentBytes{kDefaultDataSegmentBytes};
   int32_t scratchMemSize{kDefaultScratchMemSize};
   int32_t numSubBlocks{kDefaultNumSubBlocks};
+  int32_t blockSampleRatio{kDefaultBlockSampleRatio};
   llvm::StringMap<uint32_t> scopeNameToId;
   llvm::SmallVector<std::string, 16> scopeNames;
   uint32_t numScopes{0};
   mlir::Value buffer;
-  // Per-section offset (in i32 words): (blockIdx * numSubBlocks + subBlockIdx) * scratchMemSize / 4
-  // Each sub-block writes to its own section of the proton buffer to avoid
-  // concurrent writes from multiple AICore sub-blocks within the same block.
+  // Per-section offset (in i32 words): (slotIdx * numSubBlocks + subBlockIdx) * scratchMemSize / 4
+  // When blockSampleRatio == 1, slotIdx == blockIdx. When > 1, slotIdx = blockIdx / ratio.
   mlir::Value sectionOffset;
+  // Condition: blockIdx % blockSampleRatio == 0 (only set when blockSampleRatio > 1)
+  mlir::Value shouldProfile;
+  // Original block identity: blockIdx * numSubBlocks + subBlockIdx
+  mlir::Value origCombinedIdx;
 
   void detectSubBlocks()
   {
@@ -164,8 +172,6 @@ private:
     auto bufType = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i32Type,
                                          mlir::MemRefLayoutAttrInterface{}, gmSpaceAttr);
 
-    // Insert proton_buf as a function argument BEFORE grid_info args.
-    // This pass runs after TritonToLinalg, so BlockPtrAnalysis is no longer active.
     auto funcType = mlir::dyn_cast<mlir::func::FuncOp>(funcOp);
     constexpr unsigned kLaunchGridRank = 3;
     unsigned numArgsBefore = funcType.getNumArguments();
@@ -186,46 +192,76 @@ private:
     auto zeroI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, i64Type);
     auto zeroI32 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, i32Type);
 
-    // Use GetBlockIdxOp + GetSubBlockIdxOp for per-section offset.
-    // Each block * numSubBlocks + subBlockIdx gives a unique section index,
-    // so concurrent sub-blocks within the same block write to distinct sections.
     auto blockIdxI64 = builder.create<mlir::hivm::GetBlockIdxOp>(loc, i64Type);
     auto subBlockIdxI64 = builder.create<mlir::hivm::GetSubBlockIdxOp>(loc, i64Type);
     auto numSubBlocksI64 = builder.create<mlir::arith::ConstantIntOp>(
         loc, static_cast<int64_t>(numSubBlocks), i64Type);
-    auto blockOffsetI64 = builder.create<mlir::arith::MulIOp>(
+
+    // Original block identity: blockIdx * numSubBlocks + subBlockIdx
+    auto origBlockOffsetI64 = builder.create<mlir::arith::MulIOp>(
         loc, blockIdxI64, numSubBlocksI64);
-    auto combinedIdxI64 = builder.create<mlir::arith::AddIOp>(
-        loc, blockOffsetI64, subBlockIdxI64);
+    origCombinedIdx = builder.create<mlir::arith::AddIOp>(
+        loc, origBlockOffsetI64, subBlockIdxI64);
+
+    // Compute slot-based combined index for section offset
+    mlir::Value slotCombinedIdx;
+    if (blockSampleRatio > 1) {
+      auto ratioI64 = builder.create<mlir::arith::ConstantIntOp>(
+          loc, static_cast<int64_t>(blockSampleRatio), i64Type);
+      auto remOp = builder.create<mlir::arith::RemUIOp>(loc, blockIdxI64, ratioI64);
+      shouldProfile = builder.create<mlir::arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, remOp, zeroI64);
+      auto slotIdxI64 = builder.create<mlir::arith::DivUIOp>(loc, blockIdxI64, ratioI64);
+      auto slotBlockOffsetI64 = builder.create<mlir::arith::MulIOp>(
+          loc, slotIdxI64, numSubBlocksI64);
+      slotCombinedIdx = builder.create<mlir::arith::AddIOp>(
+          loc, slotBlockOffsetI64, subBlockIdxI64);
+    } else {
+      slotCombinedIdx = origCombinedIdx;
+    }
+
     auto scratchWordsI64 = builder.create<mlir::arith::ConstantIntOp>(
         loc, static_cast<int64_t>(scratchMemSize / 4), i64Type);
     auto sectionOffI64 = builder.create<mlir::arith::MulIOp>(
-        loc, combinedIdxI64, scratchWordsI64);
+        loc, slotCombinedIdx, scratchWordsI64);
     auto indexType = builder.getIndexType();
     sectionOffset = builder.create<mlir::arith::IndexCastOp>(
         loc, indexType, sectionOffI64);
 
-    auto preambleVal = builder.create<mlir::arith::ConstantIntOp>(
-        loc, static_cast<int64_t>(kPreamble), i32Type);
-    storeI32(builder, loc, preambleVal, kOffPreamble);
+    // Emit header stores, optionally guarded by scf.if
+    auto emitHeaderStores = [&]() {
+      auto preambleVal = builder.create<mlir::arith::ConstantIntOp>(
+          loc, static_cast<int64_t>(kPreamble), i32Type);
+      storeI32(builder, loc, preambleVal, kOffPreamble);
 
-    auto blockIdVal = builder.create<mlir::arith::TruncIOp>(
-        loc, i32Type, combinedIdxI64);
-    storeI32(builder, loc, blockIdVal, kOffBlockId);
+      auto blockIdVal = builder.create<mlir::arith::TruncIOp>(
+          loc, i32Type, origCombinedIdx);
+      storeI32(builder, loc, blockIdVal, kOffBlockId);
 
-    auto procIdVal = builder.create<mlir::arith::TruncIOp>(loc, i32Type, combinedIdxI64);
-    storeI32(builder, loc, procIdVal, kOffProcId);
+      auto procIdVal = builder.create<mlir::arith::TruncIOp>(
+          loc, i32Type, slotCombinedIdx);
+      storeI32(builder, loc, procIdVal, kOffProcId);
 
-    auto bufSizeVal = builder.create<mlir::arith::ConstantIntOp>(
-        loc, static_cast<int64_t>(dataSegmentBytes), i32Type);
-    storeI32(builder, loc, bufSizeVal, kOffBufSize);
+      auto bufSizeVal = builder.create<mlir::arith::ConstantIntOp>(
+          loc, static_cast<int64_t>(dataSegmentBytes), i32Type);
+      storeI32(builder, loc, bufSizeVal, kOffBufSize);
 
-    auto initSysCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
-    storeI64(builder, loc, initSysCnt.getResult(), kOffInitTime);
+      auto initSysCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
+      storeI64(builder, loc, initSysCnt.getResult(), kOffInitTime);
 
-    storeI64(builder, loc, zeroI64.getResult(), kOffPreFinalTime);
-    storeI64(builder, loc, zeroI64.getResult(), kOffPostFinalTime);
-    storeI32(builder, loc, zeroI32, kOffCountVec);
+      storeI64(builder, loc, zeroI64.getResult(), kOffPreFinalTime);
+      storeI64(builder, loc, zeroI64.getResult(), kOffPostFinalTime);
+      storeI32(builder, loc, zeroI32, kOffCountVec);
+    };
+
+    if (blockSampleRatio > 1) {
+      auto ifOp = builder.create<mlir::scf::IfOp>(loc, shouldProfile, false);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      emitHeaderStores();
+      builder.setInsertionPointAfter(ifOp);
+    } else {
+      emitHeaderStores();
+    }
 
     return mlir::success();
   }
@@ -255,13 +291,28 @@ private:
       auto ctx = builder.getContext();
       auto i64Type = mlir::IntegerType::get(ctx, 64);
 
-      // Record the time just before the final barrier+counter for finalization
-      // overhead measurement: postFinalTime - preFinalTime = finalization cost.
-      auto preFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
-      storeI64(builder, loc, preFinalCnt.getResult(), kOffPreFinalTime);
+      auto emitFooterStores = [&]() {
+        auto preFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
+        storeI64(builder, loc, preFinalCnt.getResult(), kOffPreFinalTime);
 
-      auto postFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
-      storeI64(builder, loc, postFinalCnt.getResult(), kOffPostFinalTime);
+        auto postFinalCnt = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
+        storeI64(builder, loc, postFinalCnt.getResult(), kOffPostFinalTime);
+
+        builder.create<mlir::hivm::DCCIOp>(
+            loc,
+            mlir::hivm::DCCIMode::ALL_CACHE_LINES,
+            mlir::hivm::DataCacheKind::ALL,
+            mlir::Value{});
+      };
+
+      if (blockSampleRatio > 1) {
+        auto ifOp = builder.create<mlir::scf::IfOp>(loc, shouldProfile, false);
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        emitFooterStores();
+        builder.setInsertionPointAfter(ifOp);
+      } else {
+        emitFooterStores();
+      }
     }
 
     return mlir::success();
@@ -275,8 +326,6 @@ private:
     builder.create<mlir::memref::StoreOp>(loc, val, buffer,
                                           mlir::ValueRange{fullIdx});
   }
-
-  
 
   void storeI64(mlir::OpBuilder &builder, mlir::Location loc,
                 mlir::Value val, int32_t wordOffset)
@@ -315,23 +364,34 @@ private:
 
     auto i64Type = builder.getI64Type();
 
-    auto sysCntOp = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
-    mlir::Value cycle = sysCntOp.getResult();
+    auto emitRecordStore = [&]() {
+      auto sysCntOp = builder.create<mlir::triton::proton::ReadCycleCounterOp>(loc, i64Type);
+      mlir::Value cycle = sysCntOp.getResult();
 
-    auto it = scopeNameToId.find(scopeName);
-    if (it == scopeNameToId.end()) {
-      op.emitOpError("missing scopeId for scope: ") << scopeName;
-      return mlir::failure();
+      auto it = scopeNameToId.find(scopeName);
+      if (it == scopeNameToId.end()) {
+        op.emitOpError("missing scopeId for scope: ") << scopeName;
+        return;
+      }
+      uint32_t scopeId = it->second;
+
+      auto scopeIdAttr = mlir::IntegerAttr::get(builder.getI32Type(), scopeId);
+      auto isStartAttr = mlir::BoolAttr::get(ctx, isStart);
+      auto dataSegWordsAttr = mlir::IntegerAttr::get(builder.getI32Type(),
+          dataSegmentBytes / 4);
+
+      builder.create<mlir::hivm::ProtonCircularStoreOp>(
+          loc, buffer, sectionOffset, cycle, scopeIdAttr, isStartAttr, dataSegWordsAttr);
+    };
+
+    if (blockSampleRatio > 1) {
+      auto ifOp = builder.create<mlir::scf::IfOp>(loc, shouldProfile, false);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      emitRecordStore();
+      builder.setInsertionPointAfter(ifOp);
+    } else {
+      emitRecordStore();
     }
-    uint32_t scopeId = it->second;
-
-    auto scopeIdAttr = mlir::IntegerAttr::get(builder.getI32Type(), scopeId);
-    auto isStartAttr = mlir::BoolAttr::get(ctx, isStart);
-    auto dataSegWordsAttr = mlir::IntegerAttr::get(builder.getI32Type(),
-        dataSegmentBytes / 4);
-
-    builder.create<mlir::hivm::ProtonCircularStoreOp>(
-        loc, buffer, sectionOffset, cycle, scopeIdAttr, isStartAttr, dataSegWordsAttr);
 
     op.erase();
     return mlir::success();
@@ -369,6 +429,9 @@ private:
     funcOp->setAttr(
         "proton_num_sub_blocks",
         mlir::IntegerAttr::get(i32Type, numSubBlocks));
+    funcOp->setAttr(
+        "proton_sample_every_n",
+        mlir::IntegerAttr::get(i32Type, blockSampleRatio));
   }
 };
 
@@ -410,13 +473,6 @@ struct ReadCycleCounterToGetSysCntLowering
     auto ctx = rewriter.getContext();
     auto i64Type = mlir::IntegerType::get(ctx, 64);
 
-    // Insert PipeBarrierOp(PIPE_ALL) before GetSysCntOp to prevent the AICore
-    // VLIW scheduler from bundling start/end GetSysCnt reads in the same
-    // issue slot. Without this barrier, short scopes (e.g. 'init' with only
-    // 2 arithmetic ops) produce zero-duration timing entries because both
-    // GetSysCnt reads observe identical cycle values. GetSysCntOp also has
-    // MemoryEffects<[MemRead, MemWrite]> to prevent CSE from merging
-    // multiple GetSysCntOps.
     auto pipeAllAttr = mlir::hivm::PipeAttr::get(ctx, mlir::hivm::PIPE::PIPE_ALL);
     rewriter.create<mlir::hivm::PipeBarrierOp>(loc, pipeAllAttr);
 
@@ -450,12 +506,18 @@ struct TritonAscendProtonToHIVMPass
       llvm::cl::desc("Size in bytes of the per-block circular data segment"),
       llvm::cl::init(kDefaultDataSegmentBytes)};
 
+  Option<int32_t> blockSampleRatio{
+      *this, "block-sample-ratio",
+      llvm::cl::desc("Profile 1 out of N blocks (1 = all blocks)"),
+      llvm::cl::init(kDefaultBlockSampleRatio)};
+
   void getDependentDialects(mlir::DialectRegistry &registry) const override
   {
     registry.insert<mlir::hivm::HIVMDialect>();
     registry.insert<mlir::arith::ArithDialect>();
     registry.insert<mlir::func::FuncDialect>();
     registry.insert<mlir::memref::MemRefDialect>();
+    registry.insert<mlir::scf::SCFDialect>();
   }
 
   void runOnOperation() override
@@ -469,7 +531,7 @@ struct TritonAscendProtonToHIVMPass
         return mlir::WalkResult::advance();
       }
 
-      ProtonRecordConverter converter(funcOp, dataSegmentBytes);
+      ProtonRecordConverter converter(funcOp, dataSegmentBytes, blockSampleRatio);
       if (mlir::failed(converter.convert())) {
         failed = true;
         return mlir::WalkResult::interrupt();
@@ -547,6 +609,16 @@ mlir::triton::proton::createTritonAscendProtonToHIVMPass(int32_t dataSegmentByte
 {
   auto pass = std::make_unique<TritonAscendProtonToHIVMPass>();
   pass->dataSegmentBytes = dataSegmentBytes;
+  return pass;
+}
+
+std::unique_ptr<mlir::Pass>
+mlir::triton::proton::createTritonAscendProtonToHIVMPass(int32_t dataSegmentBytes,
+                                                          int32_t blockSampleRatio)
+{
+  auto pass = std::make_unique<TritonAscendProtonToHIVMPass>();
+  pass->dataSegmentBytes = dataSegmentBytes;
+  pass->blockSampleRatio = blockSampleRatio;
   return pass;
 }
 

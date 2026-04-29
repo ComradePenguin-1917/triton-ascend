@@ -337,9 +337,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     opts.forceSimtTemplate = forceSimtTemplate;
     pm.addPass(mlir::triton::createDiscreteMaskAccessConversionPass(opts));});
 
-  m.def("add_triton_ascend_proton_to_hivm", [](mlir::PassManager &pm, int32_t dataSegmentBytes) {
-    pm.addPass(mlir::triton::proton::createTritonAscendProtonToHIVMPass(dataSegmentBytes));},
-    py::arg("pm"), py::arg("data_segment_bytes") = 4096);
+  m.def("add_triton_ascend_proton_to_hivm", [](mlir::PassManager &pm, int32_t dataSegmentBytes, int32_t blockSampleRatio) {
+    pm.addPass(mlir::triton::proton::createTritonAscendProtonToHIVMPass(dataSegmentBytes, blockSampleRatio));},
+    py::arg("pm"), py::arg("data_segment_bytes") = 4096, py::arg("block_sample_ratio") = 1);
 
   m.def("add_triton_ascend_proton_lower_cycle_counter", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::proton::createTritonAscendProtonLowerCycleCounterPass());});

@@ -1,5 +1,6 @@
 import functools
 import os
+import math
 from pathlib import Path
 from typing import Optional, Union
 
@@ -15,10 +16,15 @@ DEFAULT_PROFILE_NAME = "proton"
 
 DEFAULT_DATA_SEGMENT_BYTES = 4096
 _current_data_segment_bytes = DEFAULT_DATA_SEGMENT_BYTES
+_current_sample_every_n = 1
 
 
 def get_data_segment_bytes() -> int:
     return _current_data_segment_bytes
+
+
+def get_sample_every_n() -> int:
+    return _current_sample_every_n
 
 
 def _select_backend() -> str:
@@ -80,11 +86,6 @@ def start(
 
     profiler_name, profiler_path, default_mode = _resolve_backend(backend)
 
-    # Resolve mode: if user provides a mode object/string, use it;
-    # otherwise fall back to the backend's default mode string.
-    # For InstrumentationMode objects, we override the mode name with the
-    # backend-specific default (e.g. "npu" for Ascend) since the C++ side
-    # expects the device type as the first field in the mode string.
     data_segment_bytes = None
     if mode is not None:
         if isinstance(mode, BaseMode):
@@ -94,6 +95,7 @@ def start(
                 opts.append(f"buffer_size={mode.buffer_size}")
                 optimizations_str = ",".join([str(opt) for opt in mode.optimizations])
                 opts.append(f"optimizations={optimizations_str}")
+                opts.append(f"sample_every_n={mode.sample_every_n}")
             mode_str = f"{default_mode}:{':'.join(opts)}" if opts else default_mode
         else:
             mode_str = mode
@@ -103,6 +105,14 @@ def start(
     if data_segment_bytes is not None:
         global _current_data_segment_bytes
         _current_data_segment_bytes = data_segment_bytes
+
+    if mode is not None and isinstance(mode, InstrumentationMode):
+        global _current_sample_every_n
+        _current_sample_every_n = mode.sample_every_n
+
+    os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+    os.environ["TRITON_PROTON_BUF"] = str(_current_data_segment_bytes)
+    os.environ["TRITON_PROTON_SAMPLE"] = str(_current_sample_every_n)
 
     set_profiling_on()
     if hook == "triton":
@@ -127,6 +137,8 @@ def finalize(session: Optional[int] = None, output_format: str = "hatchet") -> N
         set_profiling_off()
         libproton.finalize_all(output_format)
         unregister_triton_hook()
+        for k in ("TRITON_ALWAYS_COMPILE", "TRITON_PROTON_BUF", "TRITON_PROTON_SAMPLE"):
+            os.environ.pop(k, None)
         return
 
     if is_command_line() and session != 0:

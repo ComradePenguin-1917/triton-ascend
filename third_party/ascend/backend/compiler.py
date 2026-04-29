@@ -25,6 +25,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -69,10 +70,25 @@ PROTON_DEFAULT_DATA_SEGMENT_BYTES = 4096
 
 def _get_proton_data_segment_bytes() -> int:
     try:
-        from triton.profiler.proton import get_data_segment_bytes
+        from triton.profiler.profile import get_data_segment_bytes
         return get_data_segment_bytes()
     except (ImportError, AttributeError):
         return PROTON_DEFAULT_DATA_SEGMENT_BYTES
+
+
+def _get_proton_sample_every_n() -> int:
+    import os
+    try:
+        from triton.profiler.profile import get_sample_every_n
+        val = get_sample_every_n()
+        if val > 1:
+            return val
+    except (ImportError, AttributeError):
+        pass
+    try:
+        return int(os.environ.get("TRITON_PROTON_SAMPLE_EVERY_N", "1"))
+    except ValueError:
+        return 1
 
 
 # TODO: materialize the concrete min shape
@@ -194,7 +210,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         pm7 = ir.pass_manager(mod.context)
         pm7.enable_debug()
         proton_data_segment_bytes = _get_proton_data_segment_bytes()
-        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm7, data_segment_bytes=proton_data_segment_bytes)
+        proton_sample_every_n = _get_proton_sample_every_n()
+        ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm7, data_segment_bytes=proton_data_segment_bytes, block_sample_ratio=proton_sample_every_n)
         ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm7)
         pm7.run(mod)
 
@@ -210,6 +227,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             num_sub_blocks_match = re.search(r'proton_num_sub_blocks\s*=\s*(\d+)', mod_str)
             if num_sub_blocks_match:
                 metadata["proton_num_sub_blocks"] = int(num_sub_blocks_match.group(1))
+            sample_every_n_match = re.search(r'proton_sample_every_n\s*=\s*(\d+)', mod_str)
+            if sample_every_n_match:
+                metadata["proton_sample_every_n"] = int(sample_every_n_match.group(1))
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -407,6 +427,7 @@ def _parse_proton_metadata(ttir: str, metadata: dict):
     metadata["proton_per_section_size"] = proton_per_section_size
     metadata["proton_scope_names"] = proton_scope_names
     metadata["proton_function_id"] = int(metadata["hash"][:16], 16)
+    metadata["proton_sample_every_n"] = _get_proton_sample_every_n()
 
     metadata_json = {
         "profile_scratch_size": proton_per_section_size,
@@ -1081,6 +1102,7 @@ class AscendBackend(BaseBackend):
         pfid = getattr(metadata, 'proton_function_id', None)
         psn = getattr(metadata, 'proton_scope_names', None)
         pnsb = getattr(metadata, 'proton_num_sub_blocks', None)
+        psen = getattr(metadata, 'proton_sample_every_n', None)
         return {
             "kernel_name": kernel_name,
             "hash": metadata.hash,
@@ -1090,6 +1112,7 @@ class AscendBackend(BaseBackend):
             "proton_function_id": pfid,
             "proton_scope_names": psn,
             "proton_num_sub_blocks": pnsb,
+            "proton_sample_every_n": psen,
         }
 
     def get_codegen_implementation(self):

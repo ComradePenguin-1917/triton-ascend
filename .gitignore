@@ -92,3 +92,7 @@ dist/
 
 # opencode cache
 .sisyphus/
+
+# proton trace
+.chrome_trace
+.hatchet

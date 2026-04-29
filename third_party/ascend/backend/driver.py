@@ -18,14 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-from pathlib import Path
-import tempfile
+import json
 import os
 import os.path
 import re
+import shutil
 import subprocess
 import sysconfig
-import json
+import tempfile
+from pathlib import Path
 from typing import Optional
 import functools
 import hashlib
@@ -165,6 +166,7 @@ class NPULauncher(object):
                         if not proton_metadata_path or not os.path.exists(proton_metadata_path):
                             proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
                             proton_metadata_path = os.path.join(proton_tmpdir, "proton_metadata.json")
+                            metadata["_proton_tmpdir"] = proton_tmpdir
                             num_sub_blocks = metadata.get('proton_num_sub_blocks', 1)
                             per_section_size = proton_scratch_size // num_sub_blocks if num_sub_blocks > 1 else proton_scratch_size
                             metadata_json = {
@@ -176,6 +178,10 @@ class NPULauncher(object):
                         libproton.init_function_metadata(
                             proton_function_id, kernel_name, scope_id_name_pairs, [], proton_metadata_path
                         )
+                        # Clean up temp dir created by compiler or driver
+                        proton_tmpdir = metadata.pop('_proton_tmpdir', None) or os.path.dirname(proton_metadata_path)
+                        if proton_tmpdir and os.path.isdir(proton_tmpdir):
+                            shutil.rmtree(proton_tmpdir, ignore_errors=True)
                 proton_buf_ptr = metadata.get('_proton_buffer_ptr', 0)
                 proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
                 stream = args[3]
@@ -485,6 +491,8 @@ def generate_npu_wrapper_src(constants, signature, metadata):
     enable_simt = ("simt" in parallel_mode) or metadata.force_simt_only
     proton_scratch_size = int(metadata.proton_scratch_size) \
                                if hasattr(metadata, 'proton_scratch_size') and metadata.proton_scratch_size is not None else 0
+    proton_sample_every_n = int(metadata.proton_sample_every_n) \
+                                if hasattr(metadata, 'proton_sample_every_n') and metadata.proton_sample_every_n is not None else 1
 
     def _ty_to_cpp(ty):
         if ty[0] == '*':
@@ -850,14 +858,15 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   workspace_addr_ptr = workspace_tensor.data_ptr();
   ''' if workspace_size > 0 else ''}
   {f'''
-  uint64_t protonBufSize = {proton_scratch_size} * blockNum4Workspace;
+  uint32_t protonSampledBlocks = (blockNum4Workspace + {proton_sample_every_n} - 1) / {proton_sample_every_n};
+  uint64_t protonBufSize = {proton_scratch_size} * protonSampledBlocks;
   at::Tensor proton_buf_tensor = {get_backend_func("allocate_memory", "protonBufSize", "stream")}
   proton_buf_ptr = proton_buf_tensor.data_ptr();
   if (!proton_buf_ptr) {{
     {proton_alloc_fail_code}
   }}
   PyDict_SetItemString(packedMetadata, "_proton_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_buf_ptr)));
-  PyDict_SetItemString(packedMetadata, "_proton_buffer_size", PyLong_FromUnsignedLongLong(static_cast<uint64_t>({proton_scratch_size} * blockNum4Workspace)));
+  PyDict_SetItemString(packedMetadata, "_proton_buffer_size", PyLong_FromUnsignedLongLong(static_cast<uint64_t>({proton_scratch_size} * protonSampledBlocks)));
   ''' if proton_scratch_size > 0 else ''}
   {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
@@ -926,22 +935,24 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}
    }};
    {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
-   {''
-   '// Copy proton profiling data from device to host while proton_buf_tensor'
-   '// is still alive. Without this, exit_instrumented_op would read freed'
-   '// device memory after proton_buf_tensor is destroyed at function return.'
-   'if (proton_buf_ptr != NULL && protonBufSize > 0) {'
-   '  uint8_t *proton_host_buf = NULL;'
-   '  aclError proton_copy_ret = aclrtMallocHost(reinterpret_cast<void**>(&proton_host_buf), protonBufSize);'
-   '  if (proton_copy_ret == ACL_ERROR_NONE && proton_host_buf != NULL) {'
-   '    proton_copy_ret = aclrtMemcpy(proton_host_buf, protonBufSize, proton_buf_ptr, protonBufSize, ACL_MEMCPY_DEVICE_TO_HOST);'
-   '    if (proton_copy_ret == ACL_ERROR_NONE) {'
-   '      PyDict_SetItemString(packedMetadata, "_proton_host_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_host_buf)));'
-   '    } else {'
-   '      aclrtFreeHost(proton_host_buf);'
-   '    }'
-   '  }'
-   '}' if proton_scratch_size > 0 and not enable_taskqueue else ''}
+    {''
+    '// Copy proton profiling data from device to host while proton_buf_tensor'
+    '// is still alive. Without this, exit_instrumented_op would read freed'
+    '// device memory after proton_buf_tensor is destroyed at function return.'
+    'if (proton_buf_ptr != NULL && protonBufSize > 0) {'
+    f'  {"rtStreamSynchronize(stream);" if enable_taskqueue else ""}'
+    '  aclrtDeviceSynchronize();'
+    '  uint8_t *proton_host_buf = NULL;'
+    '  aclError proton_copy_ret = aclrtMallocHost(reinterpret_cast<void**>(&proton_host_buf), protonBufSize);'
+    '  if (proton_copy_ret == ACL_ERROR_NONE && proton_host_buf != NULL) {'
+    '    proton_copy_ret = aclrtMemcpy(proton_host_buf, protonBufSize, proton_buf_ptr, protonBufSize, ACL_MEMCPY_DEVICE_TO_HOST);'
+    '    if (proton_copy_ret == ACL_ERROR_NONE) {'
+    '      PyDict_SetItemString(packedMetadata, "_proton_host_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_host_buf)));'
+    '    } else {'
+    '      aclrtFreeHost(proton_host_buf);'
+    '    }'
+    '  }'
+    '}' if proton_scratch_size > 0 else ''}
    return;
 }}
 

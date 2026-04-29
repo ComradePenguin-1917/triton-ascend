@@ -761,6 +761,8 @@ class JITFunction(KernelInterface[T]):
         )
 
     def _do_compile(self, key, signature, device, backend, target, constants, options, attrs, warmup):
+        import os
+        key = f"{key}-p{os.environ.get('TRITON_PROTON_BUF','')}-s{os.environ.get('TRITON_PROTON_SAMPLE','')}"
         kernel_cache = self.cache[device]
 
         if self._call_hook(key, signature, device, constants, options, [attrs], warmup, before=True):

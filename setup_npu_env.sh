@@ -1,71 +1,97 @@
 #!/bin/bash
-# Ascend NPU Environment Setup Script
+# Ascend NPU Environment Setup
+#
+# This script sets up environment variables required by Triton-Ascend.
+# It should be sourced:  source setup_npu_env.sh
 
 echo "=== Setting up Ascend NPU Environment ==="
 
-# Ascend Toolkit base path
-export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest/
-export ASCEND_HOME_PATH=${ASCEND_TOOLKIT_HOME}
+# ---------------------------------------------------------------------------
+# Sanitize variables that CANN's set_env.sh expects (avoids unbound errors)
+# ---------------------------------------------------------------------------
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${PYTHONPATH:-}"
+export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
 
-# Driver libraries (required by CANN)
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:$LD_LIBRARY_PATH
+# ---------------------------------------------------------------------------
+# Source CANN environment
+# ---------------------------------------------------------------------------
+CANN_SET_ENV=""
+for candidate in ~/Ascend/ascend-toolkit/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh; do
+  if [[ -f "${candidate}" ]]; then
+    CANN_SET_ENV="${candidate}"
+    break
+  fi
+done
+if [[ -z "${CANN_SET_ENV}" ]]; then
+  echo "ERROR: CANN set_env.sh not found" >&2
+  exit 1
+fi
+source "${CANN_SET_ENV}"
 
-# Runtime libraries - following official set_env.sh order
-export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/$(arch):$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/tools/aml/lib64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64/plugin:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/home/lijihang/program/llvm/b5cc222d/lib:$LD_LIBRARY_PATH
+# ---------------------------------------------------------------------------
+# Locate workspace root
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Python packages - must include TBE for operator compilation
-export PYTHONPATH=${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe:$PYTHONPATH
+# ---------------------------------------------------------------------------
+# LLVM library path
+# ---------------------------------------------------------------------------
+export LD_LIBRARY_PATH="${LLVM_SYSPATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-# TBE and OPP
-export TBE_IMPL_PATH=${ASCEND_TOOLKIT_HOME}/lib64
-export ASCEND_OPP_PATH=${ASCEND_TOOLKIT_HOME}/opp
-export ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
+# ---------------------------------------------------------------------------
+# BiSheng compiler tools (clang, lld)
+# ---------------------------------------------------------------------------
+export PATH="${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin:${PATH}"
 
-# Toolchain
-export TOOLCHAIN_HOME=${ASCEND_TOOLKIT_HOME}/toolkit
-export PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/tools/ccec_compiler/bin:$PATH
-# Add bishengir compiler first (preferred over ccec for MLIR compilation)
-export PATH=${ASCEND_TOOLKIT_HOME}/bisheng_toolkit/bishengir/bin:$PATH
+# ---------------------------------------------------------------------------
+# BiShengIR compiler for Proton lowering (bishengir-compile)
+# ---------------------------------------------------------------------------
+BISHENGIR_WS="${REPO_ROOT}/third_party/ascend/AscendNPU-IR/build/bin"
+if [[ -x "${BISHENGIR_WS}/bishengir-compile" ]]; then
+  export PATH="${BISHENGIR_WS}:${PATH}"
+  export TRITON_NPU_COMPILER_PATH="${BISHENGIR_WS}"
+else
+  export PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin:${PATH}"
+  export TRITON_NPU_COMPILER_PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin"
+fi
 
-# Triton NPU Compiler Path
-# This is required when bishengir-compile is not in PATH
-# Points to the directory containing npuc/bishengir-compile binary
-export TRITON_NPU_COMPILER_PATH=${ASCEND_TOOLKIT_HOME}/bisheng_toolkit/bishengir/bin
+# ---------------------------------------------------------------------------
+# Additional Ascend runtime paths
+# ---------------------------------------------------------------------------
+export TBE_IMPL_PATH="${ASCEND_TOOLKIT_HOME}/lib64"
+export CANN_PATH="${ASCEND_TOOLKIT_HOME}"
+export INSTALL_DIR="${ASCEND_TOOLKIT_HOME}"
 
-# CANN specific
-export CANN_PATH=${ASCEND_TOOLKIT_HOME}
-export INSTALL_DIR=${ASCEND_TOOLKIT_HOME}
-
-# Logging
+# ---------------------------------------------------------------------------
+# Runtime settings
+# ---------------------------------------------------------------------------
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
+export ASCEND_DEVICE_ID="${ASCEND_DEVICE_ID:-0}"
 
-# Device
-export ASCEND_DEVICE_ID=0
-
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 echo "✓ Environment variables set"
-echo ""
+echo
 echo "Key paths:"
-echo "  ASCEND_HOME_PATH: $ASCEND_HOME_PATH"
-echo "  TRITON_NPU_COMPILER_PATH: $TRITON_NPU_COMPILER_PATH"
-echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:0:100}..."
-echo "  PYTHONPATH: ${PYTHONPATH:0:100}..."
-echo ""
+echo "  ASCEND_HOME_PATH:         ${ASCEND_HOME_PATH}"
+echo "  TRITON_NPU_COMPILER_PATH: ${TRITON_NPU_COMPILER_PATH}"
+echo "  LLVM lib:                 ${LLVM_SYSPATH}/lib"
+echo
 echo "Verifying NPU compiler availability..."
 if command -v bishengir-compile &> /dev/null; then
-    echo "  ✓ bishengir-compile found in PATH: $(which bishengir-compile)"
-elif [ -f "${TRITON_NPU_COMPILER_PATH}/bishengir-compile" ]; then
-    echo "  ✓ bishengir-compile found at: ${TRITON_NPU_COMPILER_PATH}/bishengir-compile"
-elif [ -f "${TRITON_NPU_COMPILER_PATH}/npuc" ]; then
-    echo "  ✓ npuc found at: ${TRITON_NPU_COMPILER_PATH}/npuc"
+  echo "  ✓ bishengir-compile found: $(command -v bishengir-compile)"
 else
-    echo "  ✗ WARNING: NPU compiler not found!"
-    echo "    Expected location: ${TRITON_NPU_COMPILER_PATH}/bishengir-compile"
+  echo "  ✗ WARNING: bishengir-compile not found in PATH"
 fi
-echo ""
-echo "To use this environment:"
-echo "  source $(readlink -f $0)"
-echo "  python your_script.py"
+echo
+echo "Verifying build tools availability..."
+for tool in clang ld.lld; do
+  if command -v ${tool} &> /dev/null; then
+    echo "  ✓ ${tool} found: $(command -v ${tool})"
+  else
+    echo "  ✗ WARNING: ${tool} not found in PATH"
+  fi
+done
