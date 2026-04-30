@@ -47,14 +47,8 @@ export PATH="${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin:${PATH}"
 # ---------------------------------------------------------------------------
 # BiShengIR compiler for Proton lowering (bishengir-compile)
 # ---------------------------------------------------------------------------
-BISHENGIR_WS="${REPO_ROOT}/third_party/ascend/AscendNPU-IR/build/bin"
-if [[ -x "${BISHENGIR_WS}/bishengir-compile" ]]; then
-  export PATH="${BISHENGIR_WS}:${PATH}"
-  export TRITON_NPU_COMPILER_PATH="${BISHENGIR_WS}"
-else
-  export PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin:${PATH}"
-  export TRITON_NPU_COMPILER_PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin"
-fi
+export PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin:${PATH}"
+export TRITON_NPU_COMPILER_PATH="${ASCEND_HOME_PATH}/tools/bishengir/bin"
 
 # ---------------------------------------------------------------------------
 # Additional Ascend runtime paths

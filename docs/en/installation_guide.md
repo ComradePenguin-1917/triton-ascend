@@ -138,6 +138,11 @@ The build script automatically:
 2. Builds `bishengir-compile` from source (requires `--apply-patches` on first build)
 3. Builds and installs Triton-Ascend with Proton enabled
 
+> **Note**: Step 2 replaces the CANN installation's `bishengir-compile` at
+> `$ASCEND_HOME_PATH/tools/bishengir/bin/bishengir-compile` with the
+> Proton-modified version built from this repository. This is required for
+> Proton instrumentation support. Other CANN tools are unaffected.
+
 Key environment variables (overridable):
 
 | Variable | Default | Description |

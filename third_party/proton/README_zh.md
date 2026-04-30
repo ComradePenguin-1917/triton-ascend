@@ -154,7 +154,7 @@ proton.start(name="profile_name", context="shadow", backend="npu",
 
 通过 `InstrumentationMode` 支持以下选项：
 
-- `buffer_size`（int）：每个内核的分析缓冲区大小（字节）。0 表示默认值 4096。scope 较多时应增大以避免溢出（见已知问题）。
+- `buffer_size`（int）：每个内核的分析缓冲区大小（字节）。0 表示默认值 4096。scope 较多时应增大以避免溢出。
 - `optimizations`（List[Optimize]）：优化标记。当前 Ascend 仅实现 `time_shift`（补偿 `GetSysCntOp` + `PipeBarrier` 开销，AI Core 约 12 周期）。其他标记 API 已定义但尚未实现。
 - `sample_every_n`（int）：每 N 个 block 采样一次。1 = 全部采样（默认），2 = 每隔一个采样，以此类推。减少大 grid 的分析内存和开销。
 
@@ -204,10 +204,6 @@ npu-native 模式需要安装 CANN 工具包，并设置 `ASCEND_HOME_PATH` 或 
 - Ascend NPU 设备可见性
 
 建议使用 `ASCEND_RT_VISIBLE_DEVICES` 环境变量控制 Ascend NPU 的设备可见性。使用 `CUDA_VISIBLE_DEVICES` 或其他非 Ascend 设备环境变量可能导致异常。
-
-- Ascend NPU instrumentation 模式：缓冲区溢出可能导致部分数据丢失
-
-当循环分析缓冲区溢出（即分析事件数超过 `buffer_size / 8` 的单 warp 容量）时，Ascend NPU 硬件缺陷可能导致部分 CTA block 的 preamble 损坏（约 30% 受影响），导致 trace 事件数量偏少。请根据需要增大 `buffer_size` 以避免溢出。
 
 - Ascend NPU instrumentation 模式：同进程多配置不支持
 

@@ -166,7 +166,7 @@ proton.start(name="profile_name", context="shadow", backend="npu",
 
 The instrumentation mode supports the following options via `InstrumentationMode`:
 
-- `buffer_size` (int): Per-kernel profiling buffer size in bytes. 0 means default (4096). Increase for kernels with many scopes to avoid overflow (see Known Issues).
+- `buffer_size` (int): Per-kernel profiling buffer size in bytes. 0 means default (4096). Increase for kernels with many scopes to avoid overflow.
 - `optimizations` (List[Optimize]): Optimization flags. Currently, only `time_shift` is implemented on Ascend (compensates for `GetSysCntOp` + `PipeBarrier` overhead, ~12 cycles on AI Core). The other flags are defined in the API but not yet implemented.
 - `sample_every_n` (int): Profile every N-th block. 1 = all blocks (default), 2 = every 2nd block, etc. Reduces profiling memory and overhead for large grids.
 
@@ -216,10 +216,6 @@ The npu-native mode requires CANN toolkit to be installed and `ASCEND_HOME_PATH`
 - Visible devices on Ascend NPUs
 
 Environment variables `ASCEND_RT_VISIBLE_DEVICES` is recommended to control device visibility on Ascend NPUs. Using `CUDA_VISIBLE_DEVICES` or other non-Ascend device environment variables may cause unexpected behavior.
-
-- Ascend NPU instrumentation mode: buffer overflow may cause partial data loss
-
-On Ascend NPU, when the circular profiling buffer overflows (i.e., the number of profiling events exceeds the per-warp buffer capacity of `buffer_size / 8`), a hardware errata may cause corrupted preambles in some CTA blocks (~30% affected). This results in fewer trace events than expected. If needed, please increase `buffer_size` to prevent overflow.
 
 - Ascend NPU instrumentation mode: same-process multi-configuration not supported
 

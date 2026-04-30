@@ -125,8 +125,9 @@ if [ ! -f "${BISHENGIR_BUILD}/bin/bishengir-compile" ]; then
     cmake --build "${BISHENGIR_BUILD}" --target bishengir-compile -j "${MAX_JOBS}"
 fi
 if [ -f "${BISHENGIR_BUILD}/bin/bishengir-compile" ]; then
-    export TRITON_NPU_COMPILER_PATH="${BISHENGIR_BUILD}/bin"
-    echo "  Using workspace bishengir-compile"
+    cp "${BISHENGIR_BUILD}/bin/bishengir-compile" \
+       "${ASCEND_HOME_PATH}/tools/bishengir/bin/bishengir-compile"
+    echo "  installed to CANN"
 fi
 
 # ---------------------------------------------------------------------------

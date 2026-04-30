@@ -46,12 +46,19 @@ namespace {
 static constexpr int32_t kHeaderBytes = 40;   // 4*i32 + 3*i64
 static constexpr int32_t kTotalUnits = 1;     // AICore = 1 unit per section
 static constexpr int32_t kCountVecBytes = kTotalUnits * 4;
+static constexpr int32_t kCacheLineSize = 64;
 static constexpr int32_t kDefaultDataSegmentBytes = 4096;
-static constexpr int32_t kDefaultScratchMemSize =
+static constexpr int32_t kDefaultScratchMemSizeUnpadded =
     kHeaderBytes + kCountVecBytes + kDefaultDataSegmentBytes; // 4140
+static constexpr int32_t kDefaultScratchMemSize =
+    (kDefaultScratchMemSizeUnpadded + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
 static constexpr int32_t kDefaultNumSubBlocks = 1;
 static constexpr int32_t kDefaultBlockSampleRatio = 1;
 static constexpr uint32_t kPreamble = 0xdeadbeef;
+
+static int32_t alignToCacheLine(int32_t size) {
+  return (size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+}
 
 static constexpr int32_t kOffPreamble = 0;
 static constexpr int32_t kOffBlockId = 1;
@@ -72,7 +79,7 @@ public:
   ProtonRecordConverter(mlir::Operation *funcOp, int32_t dataSegBytes,
                         int32_t blockSampleRatio = kDefaultBlockSampleRatio)
       : funcOp(funcOp), dataSegmentBytes(dataSegBytes),
-        scratchMemSize(kHeaderBytes + kCountVecBytes + dataSegBytes),
+        scratchMemSize(alignToCacheLine(kHeaderBytes + kCountVecBytes + dataSegBytes)),
         blockSampleRatio(blockSampleRatio) {}
 
   mlir::LogicalResult convert()

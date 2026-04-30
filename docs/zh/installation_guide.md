@@ -137,6 +137,10 @@ bash build.sh
 2. 从源码编译 `bishengir-compile`（首次构建需配合 `--apply-patches` 打补丁）
 3. 编译安装 Triton-Ascend（默认启用 Proton）
 
+> **注意**：第 2 步会将本仓库编译的、支持 Proton 的 `bishengir-compile`
+> 覆盖到 CANN 安装路径 `$ASCEND_HOME_PATH/tools/bishengir/bin/bishengir-compile`。
+> 这是 Proton instrumentation 模式的必要条件，不影响其他 CANN 工具。
+
 关键环境变量（可覆盖）：
 
 | 变量 | 默认值 | 说明 |
