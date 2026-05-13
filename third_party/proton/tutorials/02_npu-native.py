@@ -48,18 +48,17 @@ def gemm_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
+
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    msk_m = offs_am < M
-    msk_n = offs_bn < N
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=msk_m[:, None] and (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=0.0)
-        b = tl.load(b_ptrs, mask=msk_n[None, :] and (offs_k[:, None] < K - k * BLOCK_SIZE_K), other=0.0)
+        a = tl.load(a_ptrs, mask=offs_am[:, None] < M, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_bn[None, :] < N, other=0.0)
         accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk

@@ -68,29 +68,6 @@ from triton.tools.get_ascend_devices import is_compile_on_910_95
 PROTON_DEFAULT_DATA_SEGMENT_BYTES = 4096
 
 
-def _get_proton_data_segment_bytes() -> int:
-    try:
-        from triton.profiler.profile import get_data_segment_bytes
-        return get_data_segment_bytes()
-    except (ImportError, AttributeError):
-        return PROTON_DEFAULT_DATA_SEGMENT_BYTES
-
-
-def _get_proton_sample_every_n() -> int:
-    import os
-    try:
-        from triton.profiler.profile import get_sample_every_n
-        val = get_sample_every_n()
-        if val > 1:
-            return val
-    except (ImportError, AttributeError):
-        pass
-    try:
-        return int(os.environ.get("TRITON_PROTON_SAMPLE_EVERY_N", "1"))
-    except ValueError:
-        return 1
-
-
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
@@ -121,7 +98,7 @@ def make_ttir(mod, metadata, opt):
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     ttir_code = str(mod)
-    _parse_proton_metadata(ttir_code, metadata)
+    _parse_proton_metadata(ttir_code, metadata, opt)
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
         dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
@@ -209,8 +186,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
 
         pm7 = ir.pass_manager(mod.context)
         pm7.enable_debug()
-        proton_data_segment_bytes = _get_proton_data_segment_bytes()
-        proton_sample_every_n = _get_proton_sample_every_n()
+        proton_data_segment_bytes = opt.proton_data_segment_bytes
+        proton_sample_every_n = opt.proton_sample_every_n
         ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm7, data_segment_bytes=proton_data_segment_bytes, block_sample_ratio=proton_sample_every_n)
         ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm7)
         pm7.run(mod)
@@ -402,7 +379,7 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     return linalg, metadata
 
 
-def _parse_proton_metadata(ttir: str, metadata: dict):
+def _parse_proton_metadata(ttir: str, metadata: dict, opt):
     """
     Parse TTIR for ascend_proton.record ops to extract scope names.
     If proton records are found, generate metadata JSON file and call
@@ -415,7 +392,7 @@ def _parse_proton_metadata(ttir: str, metadata: dict):
         return metadata
 
     unique_scopes = list(dict.fromkeys(scope_names))
-    proton_data_segment_bytes = _get_proton_data_segment_bytes()
+    proton_data_segment_bytes = opt.proton_data_segment_bytes
     proton_per_section_size = 40 + 4 + proton_data_segment_bytes  # header + countVec + dataSegment
     proton_scope_names = ":".join(unique_scopes)
 
@@ -427,7 +404,7 @@ def _parse_proton_metadata(ttir: str, metadata: dict):
     metadata["proton_per_section_size"] = proton_per_section_size
     metadata["proton_scope_names"] = proton_scope_names
     metadata["proton_function_id"] = int(metadata["hash"][:16], 16)
-    metadata["proton_sample_every_n"] = _get_proton_sample_every_n()
+    metadata["proton_sample_every_n"] = opt.proton_sample_every_n
 
     metadata_json = {
         "profile_scratch_size": proton_per_section_size,
@@ -956,6 +933,10 @@ class NPUOptions:
     compile_mode: str = "simd"
     mix_mode: str = ""
     simt_stack_limit: int = None
+
+    # Proton instrumentation parameters (matching NV's instrumentation_mode in options)
+    proton_data_segment_bytes: int = 4096
+    proton_sample_every_n: int = 1
 
     def __post_init__(self):
         # Parse compile_mode and set related fields

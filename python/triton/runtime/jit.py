@@ -584,6 +584,14 @@ class JITFunction(KernelInterface[T]):
 
         # compute cache key
         key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
+        try:
+            from triton.profiler.state import get_compile_options
+            proton_opts = get_compile_options()
+            if proton_opts:
+                key = f"{key}#proton:{sorted(proton_opts.items())}"
+                kwargs.update({k: v for k, v in proton_opts.items() if k not in kwargs})
+        except ImportError:
+            pass
         kernel = self.cache[device].get(key, None)
 
         if kernel is None:
@@ -761,8 +769,6 @@ class JITFunction(KernelInterface[T]):
         )
 
     def _do_compile(self, key, signature, device, backend, target, constants, options, attrs, warmup):
-        import os
-        key = f"{key}-p{os.environ.get('TRITON_PROTON_BUF','')}-s{os.environ.get('TRITON_PROTON_SAMPLE','')}"
         kernel_cache = self.cache[device]
 
         if self._call_hook(key, signature, device, constants, options, [attrs], warmup, before=True):

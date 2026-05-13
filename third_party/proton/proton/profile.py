@@ -11,6 +11,7 @@ from triton._C.libproton import proton as libproton
 from .flags import is_command_line, set_profiling_off, set_profiling_on
 from .hook import register_triton_hook, unregister_triton_hook
 from .mode import BaseMode, InstrumentationMode
+from . import state
 
 DEFAULT_PROFILE_NAME = "proton"
 
@@ -110,9 +111,8 @@ def start(
         global _current_sample_every_n
         _current_sample_every_n = mode.sample_every_n
 
-    os.environ["TRITON_ALWAYS_COMPILE"] = "1"
-    os.environ["TRITON_PROTON_BUF"] = str(_current_data_segment_bytes)
-    os.environ["TRITON_PROTON_SAMPLE"] = str(_current_sample_every_n)
+    state.set_compile_option("proton_data_segment_bytes", _current_data_segment_bytes)
+    state.set_compile_option("proton_sample_every_n", _current_sample_every_n)
 
     set_profiling_on()
     if hook == "triton":
@@ -135,10 +135,9 @@ def deactivate(session: Optional[int] = 0) -> None:
 def finalize(session: Optional[int] = None, output_format: str = "hatchet") -> None:
     if session is None:
         set_profiling_off()
+        state.clear_compile_options()
         libproton.finalize_all(output_format)
         unregister_triton_hook()
-        for k in ("TRITON_ALWAYS_COMPILE", "TRITON_PROTON_BUF", "TRITON_PROTON_SAMPLE"):
-            os.environ.pop(k, None)
         return
 
     if is_command_line() and session != 0:
