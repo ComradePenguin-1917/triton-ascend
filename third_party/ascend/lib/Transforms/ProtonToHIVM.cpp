@@ -67,12 +67,6 @@ static constexpr int32_t kOffBufSize = 3;
 static constexpr int32_t kOffInitTime = 4;
 static constexpr int32_t kOffPreFinalTime = 6;
 static constexpr int32_t kOffPostFinalTime = 8;
-static constexpr int32_t kOffCountVec = 10;
-static constexpr int32_t kOffDataSegment = 11;
-
-static constexpr uint32_t kEndBit = 0x80000000u;
-static constexpr uint32_t kScopeIdShift = 23;
-static constexpr uint32_t kCycleUpperMask = 0x7FFu;
 
 class ProtonRecordConverter {
 public:
@@ -258,7 +252,7 @@ private:
 
       storeI64(builder, loc, zeroI64.getResult(), kOffPreFinalTime);
       storeI64(builder, loc, zeroI64.getResult(), kOffPostFinalTime);
-      storeI32(builder, loc, zeroI32, kOffCountVec);
+      storeI32(builder, loc, zeroI32, mlir::hivm::ProtonCircularStoreOp::kOffCountVec);
     };
 
     if (blockSampleRatio > 1) {
