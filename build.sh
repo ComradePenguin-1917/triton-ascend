@@ -121,6 +121,8 @@ if [ ! -f "${BISHENGIR_BUILD}/bin/bishengir-compile" ]; then
         -DLLVM_TARGETS_TO_BUILD=AArch64 \
         -DBSPUB_DAVINCI_BISHENGIR=ON \
         -DBISHENGIR_PUBLISH=ON \
+        -DBISHENGIR_BUILD_TEMPLATE=ON \
+        -DBISHENG_COMPILER_PATH="${ASCEND_HOME_PATH}/bin" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
     cmake --build "${BISHENGIR_BUILD}" --target bishengir-compile -j "${MAX_JOBS}"
 fi
