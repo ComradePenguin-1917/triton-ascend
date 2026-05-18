@@ -161,7 +161,7 @@ class NPULauncher(object):
                     else:
                         unique_scopes = []
                     if unique_scopes:
-                        kernel_name = metadata.get('name', metadata.get('hash', 'unknown')).split()[0]
+                        kernel_name = metadata.get('kernel_name', metadata.get('hash', 'unknown')).split()[0]
                         scope_id_name_pairs = list(enumerate(unique_scopes))
                         if not proton_metadata_path or not os.path.exists(proton_metadata_path):
                             proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
