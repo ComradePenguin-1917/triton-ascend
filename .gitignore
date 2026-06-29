@@ -106,3 +106,10 @@ dist/
 *.egg-info/
 .eggs/
 docs/zh/python-api/generated/
+
+# opencode cache
+.sisyphus/
+
+# proton trace
+.chrome_trace
+.hatchet

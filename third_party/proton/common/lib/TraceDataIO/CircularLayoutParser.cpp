@@ -43,6 +43,9 @@ void CircularLayoutParser::parseMetadata() {
   bt.blockId = decoder.decode<I32Entry>()->value;
   bt.procId = decoder.decode<I32Entry>()->value;
   bt.bufSize = decoder.decode<I32Entry>()->value;
+  bt.initTime = decoder.decode<I64Entry>()->value;
+  bt.preFinalTime = decoder.decode<I64Entry>()->value;
+  bt.postFinalTime = decoder.decode<I64Entry>()->value;
 
   std::vector<uint32_t> countVec;
   for (int i = 0; i < getConfig().totalUnits; i++) {
@@ -53,13 +56,16 @@ void CircularLayoutParser::parseMetadata() {
   int maxCountPerUnit = bt.bufSize / getConfig().uidVec.size() / 8;
 
   for (auto uid : getConfig().uidVec) {
+    // Each event is 2 words (8 bytes) and countVec captures the number of words
+    // of each warp captured during profiling
     auto count = countVec[uid];
+    auto numEvent = count / 2;
 
-    if (count > maxCountPerUnit) {
+    if (numEvent > maxCountPerUnit) {
       std::cerr << "Warning (cta" << bt.blockId << ", warp" << uid
-                << "): first " << count - maxCountPerUnit
+                << "): first " << numEvent - maxCountPerUnit
                 << " events are dropped due to insufficient buffer size ("
-                << maxCountPerUnit << "/" << count << ")" << std::endl;
+                << maxCountPerUnit << "/" << numEvent << ")" << std::endl;
     }
 
     auto &trace = bt.traces.emplace_back();
@@ -145,13 +151,13 @@ void CircularLayoutParser::parseBlock() {
 }
 
 PreambleException::PreambleException(const std::string &msg)
-    : ParserException(msg, ExceptionSeverity::ERROR) {}
+    : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 ScopeMisMatchException::ScopeMisMatchException(const std::string &msg)
     : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 ClockOverflowException::ClockOverflowException(const std::string &msg)
-    : ParserException(msg, ExceptionSeverity::ERROR) {}
+    : ParserException(msg, ExceptionSeverity::WARNING) {}
 
 namespace {
 Device decodeDevice(const uint32_t dev) {
@@ -163,6 +169,10 @@ Device decodeDevice(const uint32_t dev) {
     break;
   case 2:
     device.type = DeviceType::HIP;
+    device.arch = "";
+    break;
+  case 3:
+    device.type = DeviceType::ASCEND;
     device.arch = "";
     break;
   default:
@@ -243,6 +253,10 @@ uint64_t proton::getTimeShiftCost(const CircularLayoutParserConfig &config) {
     return 7;
   else if (config.device.type == DeviceType::HIP)
     return 36;
+  else if (config.device.type == DeviceType::ASCEND)
+    // GetSysCntOp + PipeBarrier overhead on AICore.
+    // Ascend AICore has in-order pipeline; barrier+counter cost is ~12 cycles.
+    return 12;
 
   return 0;
 }

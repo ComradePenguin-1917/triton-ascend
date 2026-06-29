@@ -11,6 +11,8 @@
 
 #include "ascend/include/AutoBlockify/Passes.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
+#include "ascend/include/Dialect/TritonAscendProton/IR/TritonAscendProtonDialect.h"
+#include "ascend/include/Dialect/TritonAscendProton/Transforms/Passes.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
@@ -383,6 +385,13 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
               mlir::triton::createDiscreteMaskAccessConversionPass(opts));
         });
 
+  m.def("add_triton_ascend_proton_to_hivm", [](mlir::PassManager &pm, int32_t dataSegmentBytes, int32_t blockSampleRatio) {
+    pm.addPass(mlir::triton::proton::createTritonAscendProtonToHIVMPass(dataSegmentBytes, blockSampleRatio));},
+    py::arg("pm"), py::arg("data_segment_bytes") = 4096, py::arg("block_sample_ratio") = 1);
+
+  m.def("add_triton_ascend_proton_lower_cycle_counter", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::proton::createTritonAscendProtonLowerCycleCounterPass());});
+
   m.def("add_triton_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());
   });
@@ -431,6 +440,7 @@ void init_triton_ascend(py::module &&m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::ascend::TritonAscendDialect>();
+    mlir::triton::proton::registerTritonAscendProtonDialect(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

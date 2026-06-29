@@ -3,30 +3,41 @@
 #include "Context/Shadow.h"
 #include "Data/TraceData.h"
 #include "Data/TreeData.h"
+#ifdef PROTON_ENABLE_CUDA
 #include "Profiler/Cupti/CuptiProfiler.h"
+#endif
 #include "Profiler/Instrumentation/InstrumentationProfiler.h"
+#ifdef PROTON_ENABLE_HIP
 #include "Profiler/Roctracer/RoctracerProfiler.h"
+#endif
+#ifdef PROTON_ENABLE_NPU
+#include "Profiler/Ascend/AscendProfiler.h"
+#endif
 #include "Utility/String.h"
+#include <iostream>
 
 namespace proton {
 
 namespace {
 
-Profiler *getProfiler(const std::string &name, const std::string &path,
-                      const std::string &mode) {
-  std::vector<std::string> modeAndOptions = proton::split(mode, ":");
+Profiler *makeProfiler(const std::string &name, const std::string &path) {
+#ifdef PROTON_ENABLE_CUDA
   if (proton::toLower(name) == "cupti") {
-    auto *profiler = &CuptiProfiler::instance();
-    profiler->setLibPath(path);
-    if (proton::toLower(modeAndOptions[0]) == "pcsampling")
-      profiler->enablePCSampling();
-    return profiler;
+    return &CuptiProfiler::instance().setLibPath(path);
   }
+#endif
+#ifdef PROTON_ENABLE_HIP
   if (proton::toLower(name) == "roctracer") {
     return &RoctracerProfiler::instance();
   }
+#endif
+#ifdef PROTON_ENABLE_NPU
+  if (proton::toLower(name) == "ascend" || proton::toLower(name) == "npu") {
+    return &AscendProfiler::instance();
+  }
+#endif
   if (proton::toLower(name) == "instrumentation") {
-    return InstrumentationProfiler::instance().setMode(modeAndOptions);
+    return &InstrumentationProfiler::instance();
   }
   throw std::runtime_error("Unknown profiler: " + name);
 }
@@ -82,11 +93,25 @@ void Session::finalize(const std::string &outputFormat) {
 
 size_t Session::getContextDepth() { return contextSource->getDepth(); }
 
+Profiler *SessionManager::validateAndSetProfilerMode(Profiler *profiler,
+                                                     const std::string &mode) {
+  std::vector<std::string> modeAndOptions = proton::split(mode, ":");
+  for (auto &[id, session] : sessions) {
+    if (session->getProfiler() == profiler &&
+        session->getProfiler()->getMode() != modeAndOptions) {
+      throw std::runtime_error("Cannot add a session with the same profiler "
+                               "but a different mode than existing sessions");
+    }
+  }
+  return profiler->setMode(modeAndOptions);
+}
+
 std::unique_ptr<Session> SessionManager::makeSession(
     size_t id, const std::string &path, const std::string &profilerName,
     const std::string &profilerPath, const std::string &contextSourceName,
     const std::string &dataName, const std::string &mode) {
-  auto profiler = getProfiler(profilerName, profilerPath, mode);
+  auto *profiler = makeProfiler(profilerName, profilerPath);
+  profiler = validateAndSetProfilerMode(profiler, mode);
   auto contextSource = makeContextSource(contextSourceName);
   auto data = makeData(dataName, path, contextSource.get());
   auto *session = new Session(id, path, profiler, std::move(contextSource),
@@ -168,9 +193,10 @@ size_t SessionManager::addSession(const std::string &path,
     return sessionId;
   }
   auto sessionId = nextSessionId++;
+  auto newSession = makeSession(sessionId, path, profilerName, profilerPath,
+                                contextSourceName, dataName, mode);
   sessionPaths[path] = sessionId;
-  sessions[sessionId] = makeSession(sessionId, path, profilerName, profilerPath,
-                                    contextSourceName, dataName, mode);
+  sessions[sessionId] = std::move(newSession);
   return sessionId;
 }
 
@@ -244,20 +270,20 @@ void SessionManager::enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
                                          uint8_t *buffer, size_t size) {
   std::lock_guard<std::mutex> lock(mutex);
   executeInterface(instrumentationInterfaceCounts,
-                   [&](auto *instrumentationInterface) {
-                     instrumentationInterface->enterInstrumentedOp(
-                         streamId, functionId, buffer, size);
-                   });
+                    [&](auto *instrumentationInterface) {
+                      instrumentationInterface->enterInstrumentedOp(
+                          streamId, functionId, buffer, size);
+                    });
 }
 
 void SessionManager::exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                                        uint8_t *buffer, size_t size) {
+                                        uint8_t *buffer, size_t size, bool isHost) {
   std::lock_guard<std::mutex> lock(mutex);
   executeInterface(
       instrumentationInterfaceCounts,
       [&](auto *instrumentationInterface) {
         instrumentationInterface->exitInstrumentedOp(streamId, functionId,
-                                                     buffer, size);
+                                                     buffer, size, isHost);
       },
       /*isReversed=*/true);
 }
@@ -268,6 +294,16 @@ void SessionManager::addMetrics(
   for (auto [sessionId, active] : sessionActive) {
     if (active) {
       sessions[sessionId]->data->addMetrics(scopeId, metrics);
+    }
+  }
+}
+
+void SessionManager::addMetric(size_t scopeId,
+                               std::shared_ptr<Metric> metric) {
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto [sessionId, active] : sessionActive) {
+    if (active) {
+      sessions[sessionId]->data->addMetric(scopeId, metric);
     }
   }
 }
