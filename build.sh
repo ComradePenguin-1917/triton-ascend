@@ -5,7 +5,7 @@
 #
 # Prerequisites:
 #   - Active Python environment with torch, torch_npu, ninja, cmake, pybind11
-#   - LLVM_SYSPATH set to LLVM installation path (commit b5cc222d, see docs)
+#   - LLVM_SYSPATH set to LLVM installation path (commit fad3272, see docs)
 #
 # Environment variables (optional):
 #   TRITON_BUILD_PROTON           - enable Proton profiler (default: ON)
@@ -16,7 +16,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_DIR="${REPO_ROOT}/python"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -44,12 +43,7 @@ source "${REPO_ROOT}/setup_npu_env.sh"
 # ---------------------------------------------------------------------------
 if [[ ${DO_CLEAN} -eq 1 ]]; then
   echo "=== Cleaning build artifacts ==="
-  if [[ -L "${PYTHON_DIR}/build" ]]; then
-    rm -rf "$(readlink -f "${PYTHON_DIR}/build")"
-  else
-    rm -rf "${PYTHON_DIR}/build"
-  fi
-  rm -rf "${PYTHON_DIR}/dist" "${PYTHON_DIR}/triton.egg-info" "${REPO_ROOT}/build"
+  rm -rf "${REPO_ROOT}/build" "${REPO_ROOT}/dist" "${REPO_ROOT}/triton.egg-info"
 fi
 
 # ---------------------------------------------------------------------------
@@ -86,7 +80,6 @@ esac
 # ---------------------------------------------------------------------------
 echo "=== Triton-Ascend Build Script ==="
 echo "Repository      : ${REPO_ROOT}"
-echo "Python dir      : ${PYTHON_DIR}"
 echo "Build mode      : ${MODE}"
 echo "LLVM_SYSPATH    : ${LLVM_SYSPATH}"
 echo "ASCEND_HOME     : ${ASCEND_TOOLKIT_HOME:-<unset>}"
@@ -136,7 +129,7 @@ fi
 # Step 3: Build and install Triton-Ascend
 # ---------------------------------------------------------------------------
 echo "=== Building Triton-Ascend ==="
-cd "${PYTHON_DIR}"
+cd "${REPO_ROOT}"
 python3 setup.py install
 
 echo
