@@ -18,27 +18,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-from pathlib import Path
-import tempfile
+import json
 import os
 import os.path
 import re
+import shutil
 import subprocess
 import sysconfig
+import tempfile
+from pathlib import Path
 from typing import Optional
 import functools
 import hashlib
-from triton.runtime.cache import get_cache_manager, get_dump_manager
+from triton.runtime.cache import get_cache_manager, get_dump_manager, default_cache_dir
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
-from triton.backends.ascend.utils import (_precompile_npu_hash, _precompile_npu_ext, _build_npu_ext, _check_cxx11_abi,
-                                          convert_sigtype_to_int, _is_auto_map_parallel_blocks_enabled,
-                                          get_ascend_arch_from_env, is_ffts_supported, force_disable_ffts,
-                                          get_backend_func)
-
+from triton.backends.ascend.utils import (
+    _precompile_npu_hash,
+    _precompile_npu_ext,
+    _build_npu_ext,
+    _check_cxx11_abi,
+    convert_sigtype_to_int,
+    _is_auto_map_parallel_blocks_enabled,
+    get_ascend_arch_from_env,
+    is_ffts_supported,
+    force_disable_ffts,
+    get_backend_func
+)
 
 class NPUUtils(object):
-
     def __new__(cls):
         if not hasattr(cls, 'instance'):
             cls.instance = super(NPUUtils, cls).__new__(cls)
@@ -68,8 +76,9 @@ class NPUUtils(object):
         # setup for remote run
         env_arch = get_ascend_arch_from_env()
 
-    def load_binary(self, name, kernel, shared, device, mix_mode):
-        return self.npu_utils_mod.load_kernel_binary(name, kernel, shared, device, mix_mode)
+    def load_binary(self, name, kernel, shared, device):
+        fnname, mix_mode = name.split()
+        return self.npu_utils_mod.load_kernel_binary(fnname, kernel, shared, device, mix_mode)
 
     @functools.lru_cache()
     def get_device_properties(self, device):
@@ -93,20 +102,31 @@ class NPUUtils(object):
     def get_aivector_core_num(self):
         return self.get_device_properties("npu")["num_vectorcore"]
 
+    @functools.lru_cache()
+    def set_device_limit(self, device, ty, val):
+        """
+        Set npu device limit
+
+        Args:
+            device: Device id
+            ty: The type of the limit, valid types include:
+                "LOW_POWER_TIMEOUT", "WARP_STACK_SIZE", "DVG_WARP_STACK_SIZE", "STACK_SIZE"
+            val: The specific meaning of the value depends on the type of limit.
+        """
+        self.npu_utils_mod.set_device_limit(device, ty, val)
+
 
 class NPULauncher(object):
-
     def __init__(self, src, metadata):
         self.compile_only = os.getenv("TRITON_COMPILE_ONLY", 'false').lower() in ('true', '1')
-        self.enable_msprof_register_tensor = os.getenv("TRITON_REGISTER_TENSOR_MSPROF",
-                                                       'false').lower() in ('true', '1')
+        self.enable_msprof_register_tensor = os.getenv("TRITON_REGISTER_TENSOR_MSPROF", 'false').lower() in ('true', '1')
         debug_mode = metadata.debug
         header_src = generate_npu_header_src()
         constants = src.constants if hasattr(src, "constants") else dict()
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
-        wrapper_src = make_launcher(constants, signature, metadata)
+        wrapper_src = generate_npu_wrapper_src(constants, signature, metadata)
         so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)
         # setup for remote run
         # TODO: use a var to pack all vars required to run on a remote machine
@@ -124,6 +144,51 @@ class NPULauncher(object):
             cache_manager = get_cache_manager(args[5]['hash'])
             print("[INFO]: skip running kernel")
             print(f"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}")
+        # Proton instrumentation: enter before launch
+        metadata = args[5]
+        proton_scratch_size = metadata.get('proton_scratch_size') or 0
+        proton_function_id = metadata.get('proton_function_id')
+        if proton_scratch_size > 0 and proton_function_id is not None:
+            try:
+                from triton._C.libproton import proton as libproton
+                proton_scope_names = metadata.get('proton_scope_names', '')
+                proton_metadata_path = metadata.get('proton_metadata_path', '')
+                if proton_scope_names:
+                    if isinstance(proton_scope_names, str):
+                        unique_scopes = proton_scope_names.split(':')
+                    elif isinstance(proton_scope_names, list):
+                        unique_scopes = proton_scope_names
+                    else:
+                        unique_scopes = []
+                    if unique_scopes:
+                        kernel_name = metadata.get('kernel_name', metadata.get('hash', 'unknown')).split()[0]
+                        scope_id_name_pairs = list(enumerate(unique_scopes))
+                        if not proton_metadata_path or not os.path.exists(proton_metadata_path):
+                            proton_tmpdir = tempfile.mkdtemp(prefix="triton_proton_")
+                            proton_metadata_path = os.path.join(proton_tmpdir, "proton_metadata.json")
+                            metadata["_proton_tmpdir"] = proton_tmpdir
+                            num_sub_blocks = metadata.get('proton_num_sub_blocks', 1)
+                            per_section_size = proton_scratch_size // num_sub_blocks if num_sub_blocks > 1 else proton_scratch_size
+                            metadata_json = {
+                                "profile_scratch_size": per_section_size,
+                                "num_warps": 1,
+                            }
+                            with open(proton_metadata_path, "w") as f:
+                                json.dump(metadata_json, f)
+                        libproton.init_function_metadata(
+                            proton_function_id, kernel_name, scope_id_name_pairs, [], proton_metadata_path
+                        )
+                        # Clean up temp dir created by compiler or driver
+                        proton_tmpdir = metadata.pop('_proton_tmpdir', None) or os.path.dirname(proton_metadata_path)
+                        if proton_tmpdir and os.path.isdir(proton_tmpdir):
+                            shutil.rmtree(proton_tmpdir, ignore_errors=True)
+                proton_buf_ptr = metadata.get('_proton_buffer_ptr', 0)
+                proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
+                stream = args[3]
+                stream_id = stream if isinstance(stream, int) else 0
+                libproton.enter_instrumented_op(stream_id, proton_function_id, 0, proton_scratch_size)
+            except Exception:
+                pass
         if self.enable_msprof_register_tensor:
             tensor_params_shape = get_backend_func("get_tensor_params_shape", *args)
             # args[5] must be the packed metadata.
@@ -135,10 +200,24 @@ class NPULauncher(object):
             profiler_registered = self.launch(*args, **kwargs)
             import triton
             triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False
-
+        # Proton instrumentation: exit after launch
+        if proton_scratch_size > 0 and proton_function_id is not None:
+            try:
+                from triton._C.libproton import proton as libproton
+                # Prefer host buffer (already copied in _launch before
+                # proton_buf_tensor was destroyed) over the stale device
+                # pointer to avoid use-after-free.
+                proton_host_buf_ptr = metadata.get('_proton_host_buffer_ptr', 0)
+                buffer_ptr = proton_host_buf_ptr if proton_host_buf_ptr else metadata.get('_proton_buffer_ptr', 0)
+                is_host = 1 if proton_host_buf_ptr else 0
+                proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
+                stream = args[3]
+                stream_id = stream if isinstance(stream, int) else 0
+                libproton.exit_instrumented_op(stream_id, proton_function_id, buffer_ptr, proton_buf_size, is_host)
+            except Exception:
+                pass
 
 class NPUDriver(DriverBase):
-
     def __init__(self):
         self.utils = NPUUtils()
         self.launcher_cls = NPULauncher
@@ -146,13 +225,11 @@ class NPUDriver(DriverBase):
 
     @classmethod
     def is_active(cls):
-
         def test_npucompiler():
             from triton.backends.ascend.utils import _get_bisheng_path
             npucompiler = _get_bisheng_path()
             targets = subprocess.check_output([npucompiler, "-print-targets"]).decode().strip().split()
             return "hiipu64" in targets
-
         try:
             return test_npucompiler()
         except Exception as e_npucompiler:
@@ -161,9 +238,6 @@ class NPUDriver(DriverBase):
             reset = "\x1b[0m"
             warnings.warn(red + str(e_npucompiler) + reset)
             return False
-
-    def map_python_to_cpp_type(self, ty: str) -> str:
-        return ty_to_cpp(ty)
 
     def get_current_target(self):
         backend = "npu"
@@ -180,10 +254,6 @@ class NPUDriver(DriverBase):
         Get current device
         """
         return get_backend_func("get_current_device")
-
-    def get_active_torch_device(self):
-        import torch
-        return torch.device("npu", self.get_current_device())
 
     def set_current_device(self, device):
         """
@@ -210,9 +280,6 @@ class NPUDriver(DriverBase):
         cache_size = 192 * 1024 * 1024
         return get_backend_func("get_empty_tensor", cache_size // 4)
 
-    def clear_cache(self, cache):
-        cache.zero_()
-
 
 def _precompile_npu_ext_with_lock(header_src, enable_precompile):
     import fcntl
@@ -220,13 +287,13 @@ def _precompile_npu_ext_with_lock(header_src, enable_precompile):
     cache = get_cache_manager(precompile_hash)
     gch_path = cache.get_file("precompiled.h.gch")
     header_path = cache.get_file("precompiled.h")
-    if enable_precompile:
+    if enable_precompile: 
         if header_path is not None and gch_path is not None:
             return header_path
     else:
         if header_path is not None:
             return header_path
-    cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip()
+    cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
     lock_path = os.path.join(cache_dir, f"{precompile_hash}.lock")
     with open(lock_path, "a+") as f:
         try:
@@ -248,7 +315,7 @@ def _precompile_npu_ext_with_lock(header_src, enable_precompile):
             return header_path
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
-
+    
 
 def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
     """
@@ -258,7 +325,7 @@ def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
     # if precompile header file and its gch file not exist, do precompile
     header_path = _precompile_npu_ext_with_lock(header_src, enable_precompile)
     assert header_path is not None, "the precompiled.h path is empty."
-
+    
     # try to get cached file
     so_cache_key = hashlib.sha256(wrapper_src.encode("utf-8")).hexdigest()
     so_cache_manager = get_cache_manager(so_cache_key)
@@ -275,7 +342,7 @@ def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
             print(f"Dumping precompiled.h to {dump_manager.cache_dir}")
             dump_manager.put(header_src, "precompiled.h", binary=False)
         print(f"Dumping {name}.cxx to {dump_manager.cache_dir}")
-        dump_manager.put(wrapper_src, f"{name}.cxx", binary=False)
+        dump_manager.put(wrapper_src, f"{name}.cxx", binary = False)
 
     cache_path = so_cache_manager.get_file(so_name)
     if cache_path is not None:
@@ -283,12 +350,12 @@ def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
 
     kernel_launcher_type = "torch"
 
+
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, f"{name}.cxx")
         with open(src_path, "w") as f:
             f.write(wrapper_src)
-        so_path = _build_npu_ext(name, header_path, src_path, kernel_launcher=kernel_launcher_type,
-                                 precompile=enable_precompile)
+        so_path = _build_npu_ext(name, header_path, src_path, kernel_launcher=kernel_launcher_type, precompile=enable_precompile)
         if debug:
             with open(so_path, "rb") as f:
                 dump_manager.put(f.read(), so_name, binary=True)
@@ -319,7 +386,7 @@ def extract_device_print_code_from_cann():
 
         # remove [aicore] functions
         aicore_positions = []
-        for m in re.finditer(r'\[aicore\]', code):
+        for m in re.finditer('\[aicore\]', code):
             aicore_positions.append(m.start())
 
         def find_aicore_function_span(src, pos):
@@ -366,7 +433,8 @@ def extract_device_print_code_from_cann():
 
 
 def generate_npu_header_src():
-    enable_taskqueue = os.getenv("TRITON_ENABLE_TASKQUEUE", 'true').lower() in ('true', '1')
+    enable_taskqueue = os.getenv(
+        "TRITON_ENABLE_TASKQUEUE", 'true').lower() in ('true', '1')
     return f"""
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
@@ -407,36 +475,8 @@ def generate_npu_header_src():
 #endif
 """
 
-
-# ------------------------
-# Launcher
-# ------------------------
-
-
-def ty_to_cpp(ty):
-    if ty[0] == '*':
-        return "void*"
-    return {
-        "i1": "int32_t",
-        "i8": "int8_t",
-        "i16": "int16_t",
-        "i32": "int32_t",
-        "i64": "int64_t",
-        "u1": "uint32_t",
-        "u8": "uint8_t",
-        "u16": "uint16_t",
-        "u32": "uint32_t",
-        "u64": "uint64_t",
-        "fp16": "float",
-        "bf16": "float",
-        "fp32": "float",
-        "f32": "float",
-        "fp64": "double",
-    }[ty]
-
-
 # the template is from triton-adapter HEAD. Wrapping the generated kernel binary into a python module
-def make_launcher(constants, signature, metadata):
+def generate_npu_wrapper_src(constants, signature, metadata):
     import os
     workspace_size = int(metadata.workspace_size) \
                           if hasattr(metadata, 'workspace_size') else -1
@@ -449,45 +489,68 @@ def make_launcher(constants, signature, metadata):
     compile_on_910_95 = metadata.compile_on_910_95
     parallel_mode = metadata.parallel_mode
     enable_simt = ("simt" in parallel_mode) or metadata.force_simt_only
+    proton_scratch_size = int(metadata.proton_scratch_size) \
+                               if hasattr(metadata, 'proton_scratch_size') and metadata.proton_scratch_size is not None else 0
+    proton_sample_every_n = int(metadata.proton_sample_every_n) \
+                                if hasattr(metadata, 'proton_sample_every_n') and metadata.proton_sample_every_n is not None else 1
 
-    def _serialize_signature(sig):
-        if isinstance(sig, tuple):
-            return ','.join(map(_serialize_signature, sig))
-        return sig
-
-    def _extracted_type(ty):
-        if isinstance(ty, tuple):
-            val = ','.join(map(_extracted_type, ty))
-            return f"[{val}]"
+    def _ty_to_cpp(ty):
         if ty[0] == '*':
-            return "PyObject*"
-        if ty in ("constexpr"):
-            return "PyObject*"
-        return ty_to_cpp(ty)
-
-    def format_of(ty):
-        if isinstance(ty, tuple):
-            val = ''.join(map(format_of, ty))
-            return f"({val})"
-        if ty[0] == '*':
-            return "O"
-        if ty in ("constexpr"):
-            return "O"
-        if ty == "void*":
-            return "O"
+            return "void*"
         return {
+            "i1": "int32_t",
+            "i8": "int8_t",
+            "i16": "int16_t",
+            "i32": "int32_t",
+            "i64": "int64_t",
+            "u1": "uint32_t",
+            "u8": "uint8_t",
+            "u16": "uint16_t",
+            "u32": "uint32_t",
+            "u64": "uint64_t",
+            "fp16": "float",
+            "bf16": "float",
+            "fp32": "float",
+            "f32": "float",
+            "fp64": "double",
+        }[ty]
+
+    def _extracted_ty(ty):
+        if ty[0] == '*':
+            return "PyObject*"
+        return {
+            'i1': 'int32_t',
+            'i8': 'int8_t',
+            'i16': 'int16_t',
+            'i32': 'int32_t',
+            'i64': 'int64_t',
+            'u1': 'uint32_t',
+            'u8': 'uint8_t',
+            'u16': 'uint16_t',
+            'u32': 'uint32_t',
+            'u64': 'uint64_t',
+            'fp16': 'float',
+            'bf16': 'float',
+            'fp32': 'float',
+            'f32': 'float',
+            'fp64': 'double',
+        }[ty]
+
+    def _format_of(ty):
+        return {
+            "PyObject*": "O",
             "float": "f",
             "double": "d",
             "long": "l",
             "int8_t": "b",
             "int16_t": "h",
             "int32_t": "i",
-            "int64_t": "L",
+            "int64_t": "l",
             "uint8_t": "B",
             "uint16_t": "H",
             "uint32_t": "I",
             "uint64_t": "K",
-        }[ty_to_cpp(ty)]
+        }[ty]
 
     def _format_of_msprof_task_type_ratio(bs_task_type, mix_mode):
         # Default fallback based on mix_mode
@@ -507,6 +570,7 @@ def make_launcher(constants, signature, metadata):
         task_type = task_type_map.get(task_type_num, default_task_type)
         return task_type, mix_block_dim_ratio
 
+    arg_decls = ', '.join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     """
     args:
         int gridX, gridY, gridZ;
@@ -516,50 +580,30 @@ def make_launcher(constants, signature, metadata):
         PyObject* launch_enter_hook, *launch_exit_hook;
         *args_expand
     """
-    args_format = ''.join([format_of(ty) for ty in signature.values()])
-    format = "iiiKKOOOO" + args_format
-    signature = ','.join(map(_serialize_signature, signature.values()))
-    signature = list(filter(bool, signature.split(',')))
-    signature = {i: s for i, s in enumerate(signature)}
-    args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
-    # Record the end of regular arguments;
-    # subsequent arguments are architecture-specific descriptors.
-    arg_decls = ', '.join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items() if ty != "constexpr")
-    internal_args_list = []
-    for i, ty in signature.items():
-        if ty[0] == "*":
-            internal_args_list.append(f"ptr_info{i}.dev_ptr")
-        elif ty != "constexpr":
-            internal_args_list.append(f"_arg{i}")
-
-    # generate glue code
-    newline = '\n  '
-    ptr_decls = [
-        f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;"
-        for i, ty in signature.items()
-        if ty[0] == "*"
-    ]
+    format = "iiiKKOOOO" + ''.join([_format_of(_extracted_ty(ty)) for ty in signature.values()])
 
     grid_info = {'X': 'i32', 'Y': 'i32', 'Z': 'i32'}
     # TODO: automatically check if gather load ops are used.
 
     arch = get_ascend_arch_from_env()
     target_support_ffts = is_ffts_supported(arch) and (not force_disable_ffts())
-    enable_device_print = os.getenv("TRITON_DEVICE_PRINT", 'false').lower() in ('true', '1')
-    enable_taskqueue = os.getenv("TRITON_ENABLE_TASKQUEUE", 'true').lower() in ('true', '1')
-    enable_grid_warn_print = os.getenv("TRITON_GRID_WARN_PRINT", 'false').lower() in ('true', '1')
-    # Per-kernel metadata wins; fall back to the env var when unset.
-    enable_auto_map_parallel_blocks = getattr(metadata, "enable_auto_blockify", None)
-    if enable_auto_map_parallel_blocks is None:
-        enable_auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
+    enable_device_print = os.getenv(
+        "TRITON_DEVICE_PRINT", 'false').lower() in ('true', '1')
+    enable_taskqueue = os.getenv(
+        "TRITON_ENABLE_TASKQUEUE", 'true').lower() in ('true', '1')
+    enable_grid_warn_print = os.getenv(
+        "TRITON_GRID_WARN_PRINT", 'false').lower() in ('true', '1')
+    enable_auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
     npu_utils = NPUUtils()
-    num_physical_blocks = npu_utils.get_aivector_core_num() if mix_mode == "aiv" else npu_utils.get_aicore_num()
+    num_physical_blocks = npu_utils.get_aivector_core_num(
+    ) if mix_mode == "aiv" else npu_utils.get_aicore_num()
     task_type, mix_block_dim_ratio = _format_of_msprof_task_type_ratio(bs_task_type, mix_mode)
     is_mix_task_type = "true" if ("MIX" in task_type) else "false"
     LINE_CHANGE_CHAR = chr(10)  # it is \n
     alloc_success_code = 'return 1;'
     sync_lock_fail_code = 'fprintf(stderr, "Error: syncBlockLock allocation failed\\n"); return;'
     workspace_fail_code = 'fprintf(stderr, "Error: workspace allocation failed\\n"); return;'
+    proton_alloc_fail_code = 'fprintf(stderr, "Error: proton buffer allocation failed\\n");'
 
     cpp_device_pointer = """
 typedef struct _DevicePtrInfo {
@@ -798,19 +842,32 @@ extern "C" {
 
 {cpp_device_pointer}
 
-static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
+static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds, PyObject *packedMetadata{', ' + arg_decls if len(signature) > 0 else ''}) {{
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
   std::string name = "";
   name.append(kernelName);
   void *workspace_addr_ptr = NULL;
+  void *proton_buf_ptr = NULL;
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
-  {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  at::Tensor workspace_tensor = {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  workspace_addr_ptr = workspace_tensor.data_ptr();
   ''' if workspace_size > 0 else ''}
+  {f'''
+  uint32_t protonSampledBlocks = (blockNum4Workspace + {proton_sample_every_n} - 1) / {proton_sample_every_n};
+  uint64_t protonBufSize = {proton_scratch_size} * protonSampledBlocks;
+  at::Tensor proton_buf_tensor = {get_backend_func("allocate_memory", "protonBufSize", "stream")}
+  proton_buf_ptr = proton_buf_tensor.data_ptr();
+  if (!proton_buf_ptr) {{
+    {proton_alloc_fail_code}
+  }}
+  PyDict_SetItemString(packedMetadata, "_proton_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_buf_ptr)));
+  PyDict_SetItemString(packedMetadata, "_proton_buffer_size", PyLong_FromUnsignedLongLong(static_cast<uint64_t>({proton_scratch_size} * protonSampledBlocks)));
+  ''' if proton_scratch_size > 0 else ''}
   {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
     uint32_t blockNum = gridX * gridY * gridZ;
@@ -828,7 +885,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     uint32_t nodeBasicBlockDim = (mixBlockNumRation << 16) + blockNum;
 
     {'cce::internal::DebugTunnelData *DTData = cce::internal::DebugTunnel::Open(blockNum);' if enable_device_print else ''}
-    rtError_t ret = RT_ERROR_NONE;
+    rtError_t ret;
     {'void *ffts_addr = NULL; uint32_t ffts_len; ret = rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len);' if target_support_ffts else ''}
     {'if (ret != RT_ERROR_NONE) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != RT_ERROR_NONE) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
     // stub argument for workspace
@@ -836,7 +893,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     uint16_t ModuleId = 0;
     {f'''
     uint64_t syncBlockLockSize = {lock_num} * sizeof(int64_t);
-    {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
+    syncBlockLock_ptr = {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
@@ -855,17 +912,19 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
       {'void* ffts_addr __attribute__((aligned(8)));' if target_support_ffts else ''}
       {'void* syncBlockLock __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}
       {'void* workspace_addr __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}
-      {' '.join(f'{ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));' for i, ty in signature.items() if i not in constants and ty != "constexpr")}
-      {' '.join(f'{ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}
+      {' '.join(f'{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));' for i, ty in signature.items() if i not in constants)}
+      {'void* proton_buf __attribute__((aligned(8)));' if proton_scratch_size > 0 and not metadata.force_simt_only else ''}
+      {' '.join(f'{_ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}
       {'void* DTData __attribute__((aligned(8)));' if enable_device_print else ''}
     }} args = {{
       {'static_cast<void*>(ffts_addr),' if target_support_ffts else ''}
       {('static_cast<void*>(syncBlockLock_ptr),' if lock_num > 0 else 'nullptr,') if not metadata.force_simt_only else ''}
       {('static_cast<void*>(workspace_addr_ptr),' if workspace_size > 0 else 'nullptr,') if not metadata.force_simt_only else ''}
       {(lambda _rt: (', '.join(_rt) + ',') if _rt else '')(
-        [f'static_cast<{ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants and ty != "constexpr"]
+        [f'static_cast<{_ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants]
       )}
-      {', '.join(f'static_cast<{ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
+      {'static_cast<void*>(proton_buf_ptr),' if proton_scratch_size > 0 and not metadata.force_simt_only else ''}
+      {', '.join(f'static_cast<{_ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
       {', static_cast<void*>(DTData)' if enable_device_print else ''}
     }};
     {cpp_msprof_call_before_launch}
@@ -876,7 +935,25 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}
    }};
    {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
-  return;
+    {''
+    '// Copy proton profiling data from device to host while proton_buf_tensor'
+    '// is still alive. Without this, exit_instrumented_op would read freed'
+    '// device memory after proton_buf_tensor is destroyed at function return.'
+    'if (proton_buf_ptr != NULL && protonBufSize > 0) {'
+    f'  {"rtStreamSynchronize(stream);" if enable_taskqueue else ""}'
+    '  aclrtDeviceSynchronize();'
+    '  uint8_t *proton_host_buf = NULL;'
+    '  aclError proton_copy_ret = aclrtMallocHost(reinterpret_cast<void**>(&proton_host_buf), protonBufSize);'
+    '  if (proton_copy_ret == ACL_ERROR_NONE && proton_host_buf != NULL) {'
+    '    proton_copy_ret = aclrtMemcpy(proton_host_buf, protonBufSize, proton_buf_ptr, protonBufSize, ACL_MEMCPY_DEVICE_TO_HOST);'
+    '    if (proton_copy_ret == ACL_ERROR_NONE) {'
+    '      PyDict_SetItemString(packedMetadata, "_proton_host_buffer_ptr", PyLong_FromUnsignedLongLong(reinterpret_cast<uint64_t>(proton_host_buf)));'
+    '    } else {'
+    '      aclrtFreeHost(proton_host_buf);'
+    '    }'
+    '  }'
+    '}' if proton_scratch_size > 0 else ''}
+   return;
 }}
 
 // Extract tensor shape from PyObject
@@ -919,13 +996,15 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
   std::vector<std::vector<int64_t>> tensorShapes;
-
-  {newline.join([f"{_extracted_type(ty)} _arg{i};" for i, ty in signature.items()])}
+  {' '.join([f"{_extracted_ty(ty)} _arg{i}; " for i, ty in signature.items()])}
   if(!PyArg_ParseTuple(
       args, \"{format}\",
       &gridX, &gridY, &gridZ, &stream, &function,
       &packedMetadata, &launch_metadata,
-      &launch_enter_hook, &launch_exit_hook{args_list})) {{
+      &launch_enter_hook, &launch_exit_hook
+      {', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''}
+      )
+    ) {{
     return NULL;
   }}
   if (__MsprofFlagL1)
@@ -938,12 +1017,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     }
   }}
 
-  if (launch_enter_hook != Py_None){{
-    PyObject* args = Py_BuildValue("(O)", launch_metadata);
-    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
-    Py_DECREF(args);
-    if (!ret)
-      return NULL;
+  if (launch_enter_hook != Py_None && !PyObject_CallObject(launch_enter_hook, args)) {{
+    return NULL;
   }}
 
   // get kernel_name
@@ -961,17 +1036,13 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   }}
 
   // raise exception asap
-  {newline.join(ptr_decls)}
-  _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0]=="*" else "" for i, ty in signature.items()])};
+  _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds, packedMetadata{', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''});
   if (PyErr_Occurred()) {{
     return NULL;
   }}
-  if(launch_exit_hook != Py_None){{
-    PyObject* args = Py_BuildValue("(O)", launch_metadata);
-    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
-    Py_DECREF(args);
-    if (!ret)
-      return NULL;
+  if (launch_exit_hook != Py_None && !PyObject_CallObject(launch_exit_hook, args)) {{
+    return NULL;
   }}
   Py_RETURN_NONE;
 }}

@@ -33,6 +33,7 @@ public:
                        const std::vector<Context> &contexts) = 0;
 
   /// Add a single metric to the data.
+  /// [MT] The implementation must be thread-safe.
   virtual void addMetric(size_t scopeId, std::shared_ptr<Metric> metric) = 0;
 
   /// Add multiple metrics to the data.
@@ -44,10 +45,12 @@ public:
   virtual void clear() = 0;
 
   /// Dump the data to the given output format.
+  /// [MT] Thread-safe.
   void dump(const std::string &outputFormat);
 
 protected:
   /// The actual implementation of the dump operation.
+  /// [MT] Thread-safe.
   virtual void doDump(std::ostream &os, OutputFormat outputFormat) const = 0;
 
   virtual OutputFormat getDefaultOutputFormat() const = 0;

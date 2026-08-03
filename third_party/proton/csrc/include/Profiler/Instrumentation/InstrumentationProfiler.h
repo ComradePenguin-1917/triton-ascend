@@ -19,13 +19,13 @@ public:
   InstrumentationProfiler() = default;
   virtual ~InstrumentationProfiler();
 
-  InstrumentationProfiler *setMode(const std::vector<std::string> &mode);
-
 protected:
   // Profiler
   virtual void doStart() override;
   virtual void doFlush() override;
   virtual void doStop() override;
+  virtual void
+  doSetMode(const std::vector<std::string> &modeAndOptions) override;
 
   // InstrumentationInterface
   void initFunctionMetadata(
@@ -34,9 +34,10 @@ protected:
       const std::vector<std::pair<size_t, size_t>> &scopeIdParentIds,
       const std::string &metadataPath) override;
   void enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                           uint8_t *buffer, size_t size) override;
+                            uint8_t *buffer, size_t size) override;
   void exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                          uint8_t *buffer, size_t size) override;
+                           uint8_t *buffer, size_t size,
+                           bool isHost = false) override;
 
   // OpInterface
   void startOp(const Scope &scope) override {

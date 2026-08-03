@@ -33,6 +33,8 @@ public:
 
   size_t getContextDepth();
 
+  Profiler *getProfiler() { return profiler; }
+
 private:
   Session(size_t id, const std::string &path, Profiler *profiler,
           std::unique_ptr<ContextSource> contextSource,
@@ -110,14 +112,19 @@ public:
                            uint8_t *buffer, size_t size);
 
   void exitInstrumentedOp(uint64_t streamId, uint64_t functionId,
-                          uint8_t *buffer, size_t size);
+                           uint8_t *buffer, size_t size, bool isHost = false);
 
   void addMetrics(size_t scopeId,
                   const std::map<std::string, MetricValueType> &metrics);
 
+  void addMetric(size_t scopeId, std::shared_ptr<Metric> metric);
+
   void setState(std::optional<Context> context);
 
 private:
+  Profiler *validateAndSetProfilerMode(Profiler *profiler,
+                                       const std::string &mode);
+
   std::unique_ptr<Session> makeSession(size_t id, const std::string &path,
                                        const std::string &profilerName,
                                        const std::string &profilerPath,

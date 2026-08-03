@@ -133,6 +133,19 @@ from .random import (
 )
 from . import target_info
 
+_ascend_cann = getattr(extra, "cann", None)
+_ascend_extension = getattr(_ascend_cann, "extension", None)
+if _ascend_extension is not None:
+    compile_hint = _ascend_extension.compile_hint
+    extract_slice = _ascend_extension.extract_slice
+    insert_slice = _ascend_extension.insert_slice
+    get_element = _ascend_extension.get_element
+    multibuffer = _ascend_extension.multibuffer
+    parallel = _ascend_extension.parallel
+    sync_block_all = _ascend_extension.sync_block_all
+    sync_block_set = _ascend_extension.sync_block_set
+    sync_block_wait = _ascend_extension.sync_block_wait
+
 __all__ = [
     "PropagateNan",
     "TRITON_MAX_TENSOR_NUMEL",
@@ -166,6 +179,7 @@ __all__ = [
     "cdiv",
     "ceil",
     "clamp",
+    "compile_hint",
     "condition",
     "const",
     "constexpr",
@@ -185,6 +199,7 @@ __all__ = [
     "exp2",
     "expand_dims",
     "extra",
+    "extract_slice",
     "fdiv",
     "flip",
     "float16",
@@ -199,7 +214,9 @@ __all__ = [
     "fma",
     "full",
     "gather",
+    "get_element",
     "histogram",
+    "insert_slice",
     "inline_asm_elementwise",
     "interleave",
     "int1",
@@ -220,9 +237,11 @@ __all__ = [
     "maximum",
     "min",
     "minimum",
+    "multibuffer",
     "multiple_of",
     "num_programs",
     "pair_uniform_to_normal",
+    "parallel",
     "permute",
     "philox",
     "philox_impl",
@@ -255,6 +274,9 @@ __all__ = [
     "store",
     "sum",
     "swizzle2d",
+    "sync_block_all",
+    "sync_block_set",
+    "sync_block_wait",
     "target_info",
     "tensor",
     "topk",

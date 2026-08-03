@@ -1,9 +1,10 @@
 #ifndef PROTON_DATA_TRACE_DATA_H_
 #define PROTON_DATA_TRACE_DATA_H_
 
-#include "Data.h"
 #include <memory>
 #include <unordered_map>
+
+#include "Data.h"
 
 namespace proton {
 
