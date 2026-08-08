@@ -78,6 +78,7 @@ public:
 
   mlir::LogicalResult convert()
   {
+    llvm::dbgs() << "[ProtonToHIVM] convert start\n";
     mlir::SmallVector<mlir::triton::proton::RecordOp, 16> recordOps;
     funcOp->walk([&](mlir::triton::proton::RecordOp op) {
       recordOps.push_back(op);
@@ -86,18 +87,23 @@ public:
     if (recordOps.empty()) {
       return mlir::success();
     }
+    llvm::dbgs() << "[ProtonToHIVM] records: " << recordOps.size() << "\n";
 
     detectSubBlocks();
+    llvm::dbgs() << "[ProtonToHIVM] detectSubBlocks done\n";
 
     assignScopeIds(recordOps);
+    llvm::dbgs() << "[ProtonToHIVM] assignScopeIds done\n";
 
     if (failed(emitHeader())) {
       return mlir::failure();
     }
+    llvm::dbgs() << "[ProtonToHIVM] emitHeader done\n";
 
     if (failed(emitFooterOps())) {
       return mlir::failure();
     }
+    llvm::dbgs() << "[ProtonToHIVM] emitFooterOps done\n";
 
     mlir::OpBuilder builder(funcOp->getContext());
     for (auto recordOp : recordOps) {
@@ -105,6 +111,7 @@ public:
         return mlir::failure();
       }
     }
+    llvm::dbgs() << "[ProtonToHIVM] convertRecordOp done\n";
 
     attachAttrs();
 
@@ -173,7 +180,7 @@ private:
     auto bufType = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i32Type,
                                          mlir::MemRefLayoutAttrInterface{}, gmSpaceAttr);
 
-    auto funcType = mlir::dyn_cast<mlir::func::FuncOp>(funcOp);
+    auto funcType = mlir::dyn_cast<mlir::FunctionOpInterface>(funcOp);
     constexpr unsigned kLaunchGridRank = 3;
     unsigned numArgsBefore = funcType.getNumArguments();
     unsigned argIdx = numArgsBefore > kLaunchGridRank * 2

@@ -351,7 +351,7 @@ def _precompile_npu_ext(header_path, gch_path):
 
     cc_cmd += get_backend_func("get_cc_cmd", build_pch=True)
 
-    cc_cmd += ["-std=c++17", "-shared", "-fPIC", "-o", gch_path]
+    cc_cmd += ["-stdlib=libstdc++", "-std=c++17", "-shared", "-fPIC", "-o", gch_path]
 
     result = subprocess.run(cc_cmd, capture_output=True, text=True)
 
@@ -410,6 +410,10 @@ def _build_npu_ext(obj_name: str, header_path, src_path, *, kernel_launcher="tor
     # FIXME: check why this condition works wrong in parall scene
     if kernel_launcher == "torch":
         cc_cmd += get_backend_func("get_cc_cmd", build_pch=False)
+        # clang++ on some platforms defaults to libc++, but torch_npu is
+        # built against libstdc++. Force libstdc++ to keep the ABI of the
+        # std::string symbols (e.g. at_npu::native::OpCommand) consistent.
+        cc_cmd += ["-stdlib=libstdc++"]
 
     cc_cmd += ["-std=c++17", "-shared", "-fPIC", "-Winvalid-pch", "-o", so_path]
 

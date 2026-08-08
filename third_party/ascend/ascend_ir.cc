@@ -316,7 +316,7 @@ void init_ascend_ir(py::module &&m) {
              ValueRange inputs{ins};
              ValueRange outputs{outs};
              TypeRange res_types{outputs};
-             auto op = self.create<hivm::CustomOp>(res_types, name, inputs, outputs);
+             auto op = self.create<hivm::CustomOp>(res_types, name, inputs, outputs, ValueRange{}, false);
              for (auto &attr : attrs) {
                std::string attr_name = py::cast<std::string>(attr.first);
                Attribute attr_value = py::cast<Attribute>(attr.second);

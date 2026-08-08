@@ -415,6 +415,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.builder.set_insertion_point_to_end(post_ret_block)
 
     def visit_FunctionDef(self, node):
+        print(f'[CODEGEN] visit_FunctionDef {node.name}', flush=True)
         arg_names, kwarg_names = self.visit(node.args)
         if self.fn:
             raise self._unsupported(node, "nested function definition is not supported.")
@@ -802,11 +803,14 @@ class CodeGenerator(ast.NodeVisitor):
         """Handle 'with' statements using dispatch pattern."""
         assert len(node.items) == 1
         context = node.items[0].context_expr
+        print(f'[CODEGEN] visit_With context={type(context).__name__}', flush=True)
 
         # Check if context is a Call and dispatch to registered handler
         if isinstance(context, ast.Call):
             withitemClass = self.visit(context.func)
+            print(f'[CODEGEN] withitemClass={withitemClass}', flush=True)
             handler = WITH_DISPATCH.get(withitemClass)
+            print(f'[CODEGEN] handler={handler}', flush=True)
             if handler:
                 return handler(self, node)
 

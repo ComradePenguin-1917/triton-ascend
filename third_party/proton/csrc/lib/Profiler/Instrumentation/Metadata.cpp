@@ -2,6 +2,8 @@
 
 #include "Profiler/Instrumentation/Metadata.h"
 #include "nlohmann/json.hpp"
+#include <sstream>
+#include <cstdio>
 
 using json = nlohmann::json;
 
@@ -12,9 +14,9 @@ void InstrumentationMetadata::parse() {
   if (!metadataFile.is_open()) {
     throw std::runtime_error("Failed to open metadata file: " + metadataPath);
   }
-
-  json metadataJson;
-  metadataFile >> metadataJson;
+  std::stringstream ss;
+  ss << metadataFile.rdbuf();
+  json metadataJson = json::parse(ss.str());
 
   if (metadataJson.contains("profile_scratch_size")) {
     scratchMemorySize = metadataJson["profile_scratch_size"].get<size_t>();

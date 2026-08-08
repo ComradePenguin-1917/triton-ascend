@@ -1,4 +1,5 @@
 #include "Profiler/Instrumentation/InstrumentationProfiler.h"
+#include <cstdio>
 #include "TraceDataIO/CircularLayoutParser.h"
 
 #ifdef PROTON_ENABLE_CUDA
@@ -195,15 +196,18 @@ void InstrumentationProfiler::enterInstrumentedOp(uint64_t streamId,
                                                   uint64_t functionId,
                                                   uint8_t *buffer,
                                                   size_t size) {
+  fprintf(stderr, "[INSTPROF] enter begin\n");
   if (!hostBuffer) {
     runtime->allocateHostBuffer(&hostBuffer, DEFAULT_HOST_BUFFER_SIZE);
   }
+  fprintf(stderr, "[INSTPROF] enter end\n");
 }
 
 void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
                                                   uint64_t functionId,
                                                   uint8_t *buffer, size_t size,
                                                   bool isHost) {
+  fprintf(stderr, "[INSTPROF] exit begin buffer=%p size=%zu isHost=%d hostBuffer=%p\n", (void*)buffer, size, isHost, (void*)hostBuffer);
   if (!buffer || !hostBuffer)
     return;
 
@@ -251,14 +255,24 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
   auto &scopeIdContexts = functionScopeIdContexts[functionId];
 
   auto parseBuffer = [&](uint8_t *bufPtr, size_t bufSize) {
+    fprintf(stderr, "[INSTPROF] parseBuffer size=%zu first64: ", bufSize);
+    for (size_t i = 0; i < std::min<size_t>(64, bufSize); i++)
+      fprintf(stderr, "%02x ", bufPtr[i]);
+    fprintf(stderr, "\n");
     ByteSpan byteSpan(bufPtr, bufSize);
     CircularLayoutParser parser(byteSpan, *circularLayoutConfig);
     try {
       parser.parse();
     } catch (const std::exception &e) {
+      fprintf(stderr, "[INSTPROF] parse FAILED: %s\n", e.what());
       return;
     }
     auto result = parser.getResult();
+    size_t totalEvents = 0;
+    for (auto &blockTrace : result->blockTraces)
+      for (auto &trace : blockTrace.traces)
+        totalEvents += trace.profileEvents.size();
+    fprintf(stderr, "[INSTPROF] parse OK blocks=%zu events=%zu\n", result->blockTraces.size(), totalEvents);
     for (auto &blockTrace : result->blockTraces) {
       for (auto &trace : blockTrace.traces) {
         for (auto &event : trace.profileEvents) {
@@ -291,7 +305,11 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
     aclrtFreeHost(buffer);
 #endif
   } else {
-    runtime->synchronizeStream(reinterpret_cast<void *>(streamId));
+    // The launcher already synchronized the stream (rtStreamSynchronize) right
+    // after rtKernelLaunch, so the kernel (and its proton writes) have
+    // completed by the time we get here. A second aclrtSynchronizeStream /
+    // aclrtSynchronizeDevice on the passed handle can crash or hang on some
+    // kernels, so skip it and go straight to the device->host copy.
     runtime->processHostBuffer(
         hostBuffer, size, buffer, size, priorityStream,
         [&](uint8_t *bufferPtr, size_t chunkSize) {

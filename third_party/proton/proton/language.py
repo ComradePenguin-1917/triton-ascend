@@ -4,9 +4,14 @@ from .flags import get_profiling_on
 
 
 def _create_record(builder, is_start, name):
+    print(f'[SCOPE] _create_record start={is_start} name={name} builder={type(builder)}', flush=True)
     if not get_profiling_on():
+        print('[SCOPE] profiling off, skip', flush=True)
         return
-    triton_proton.create_proton_record(builder.get_op_builder_capsule(), is_start, name)
+    caps = builder.get_op_builder_capsule()
+    print(f'[SCOPE] capsule={type(caps)}', flush=True)
+    triton_proton.create_proton_record(caps, is_start, name)
+    print('[SCOPE] record created', flush=True)
 
 
 def _extract_scope_name(context_expr):

@@ -25,6 +25,7 @@ import glob
 import json
 import os
 import re
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -74,6 +75,7 @@ def min_dot_size(target: GPUTarget):
 
 
 def make_ttir(mod, metadata, opt):
+    print('[PASS] make_ttir start', flush=True)
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
     # the same optimize pass for triton-ir as all other backends
@@ -134,6 +136,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             passes.common.add_cse(pm2)
             passes.common.add_canonicalizer(pm2)
             pm2.run(mod)
+        print(f'[PASS] pm2 done', flush=True)
 
         pm3 = ir.pass_manager(mod.context)
         pm3.enable_debug()
@@ -148,11 +151,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             force_simt_template
         )
         pm3.run(mod)
+        print(f'[PASS] pm3 done', flush=True)
 
         pm4 = ir.pass_manager(mod.context)
         pm4.enable_debug()
         ascend.passes.ttir.add_triton_to_annotation(pm4)
         pm4.run(mod)
+        print(f'[PASS] pm4 done', flush=True)
 
         pm5 = ir.pass_manager(mod.context)
         pm5.enable_debug()
@@ -166,6 +171,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_llvm(pm5)
         ascend.passes.ttir.add_bubble_up_operation(pm5)
         pm5.run(mod)
+        print(f'[PASS] pm5 done', flush=True)
 
         pm6 = ir.pass_manager(mod.context)
         pm6.enable_debug()
@@ -183,6 +189,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             compile_on_910_95
         )
         pm6.run(mod)
+        print(f'[PASS] pm6 done', flush=True)
 
         pm7 = ir.pass_manager(mod.context)
         pm7.enable_debug()
@@ -191,6 +198,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_ascend_proton_to_hivm(pm7, data_segment_bytes=proton_data_segment_bytes, block_sample_ratio=proton_sample_every_n)
         ascend.passes.ttir.add_triton_ascend_proton_lower_cycle_counter(pm7)
         pm7.run(mod)
+        print(f'[PASS] pm7 done', flush=True)
 
         # Extract proton profiling attributes from the lowered function.
         mod_str = str(mod)
@@ -644,6 +652,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
+        if ret.stderr:
+            sys.stderr.write(ret.stderr.decode("utf-8", "replace"))
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -827,6 +837,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
+        if ret.stderr:
+            sys.stderr.write(ret.stderr.decode("utf-8", "replace"))
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])

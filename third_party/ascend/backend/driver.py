@@ -175,6 +175,12 @@ class NPULauncher(object):
                             }
                             with open(proton_metadata_path, "w") as f:
                                 json.dump(metadata_json, f)
+                        print(f'[DRIVER] init metadata_path={proton_metadata_path}', flush=True)
+                        try:
+                            with open(proton_metadata_path) as _f:
+                                print(f'[DRIVER] metadata content: {repr(_f.read())}', flush=True)
+                        except Exception as _e:
+                            print(f'[DRIVER] metadata read err: {_e}', flush=True)
                         libproton.init_function_metadata(
                             proton_function_id, kernel_name, scope_id_name_pairs, [], proton_metadata_path
                         )
@@ -186,6 +192,7 @@ class NPULauncher(object):
                 proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
                 stream = args[3]
                 stream_id = stream if isinstance(stream, int) else 0
+                print(f'[DRIVER] enter_instrumented_op size={proton_scratch_size} stream_id={stream_id}', flush=True)
                 libproton.enter_instrumented_op(stream_id, proton_function_id, 0, proton_scratch_size)
             except Exception:
                 pass
@@ -197,7 +204,9 @@ class NPULauncher(object):
         else:
             if self.compile_only:
                 return
+            print('[DRIVER] before launch', flush=True)
             profiler_registered = self.launch(*args, **kwargs)
+            print('[DRIVER] after launch', flush=True)
             import triton
             triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False
         # Proton instrumentation: exit after launch
@@ -213,6 +222,7 @@ class NPULauncher(object):
                 proton_buf_size = metadata.get('_proton_buffer_size', proton_scratch_size)
                 stream = args[3]
                 stream_id = stream if isinstance(stream, int) else 0
+                print(f'[DRIVER] exit_instrumented_op buf_size={proton_buf_size} is_host={is_host} buf_ptr={buffer_ptr} host_ptr={proton_host_buf_ptr}', flush=True)
                 libproton.exit_instrumented_op(stream_id, proton_function_id, buffer_ptr, proton_buf_size, is_host)
             except Exception:
                 pass
@@ -696,7 +706,7 @@ extern "C" {
 """
 
     cpp_msprof_callback = """
-  MsprofRegisterCallback(8, ProfCtrlHandle);      // 8 - CCE defined in msprof headerfile slog.h
+  // TEMP(debug): msprof registration disabled (CANN 9.0.0 JSON parse crash)
 """
 
     cpp_msprof_call_before_launch = """
@@ -706,7 +716,7 @@ extern "C" {
     unsigned int threadId = 0;
     char* _kernelName = const_cast<char*>(name.c_str());
     size_t length = name.length();
-    if (__MsprofFlagL0 || __MsprofFlagL1)
+    if (false && (__MsprofFlagL0 || __MsprofFlagL1))
     {
       beginTime = MsprofSysCycleTime();
     }

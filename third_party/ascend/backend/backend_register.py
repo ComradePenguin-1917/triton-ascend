@@ -288,7 +288,9 @@ def allocate_memory(size, stream):
 
 @backend_strategy_registry.register("torch_npu", "allocate_memory")
 def allocate_memory(size, stream):
-    return f"at::zeros({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte));"
+    # TEMP(debug): at::zeros triggers torch_npu ZerosLike op which crashes in
+    # CANN 9.0.0 (LoadStaticBinJson reads empty JSON); use empty instead.
+    return f"at::empty({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte));"
 
 
 @backend_strategy_registry.register("mindspore", "allocate_sync_block_lock")

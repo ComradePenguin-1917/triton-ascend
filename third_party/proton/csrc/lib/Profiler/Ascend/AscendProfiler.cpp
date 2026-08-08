@@ -92,7 +92,12 @@ struct AscendProfiler::AscendProfilerPimpl
     }
 
     // 1. Register msprof callback (CCE module = 8)
-    msprofEnabled = (msprof::registerCallback<false>(8, profCtrlHandle) == 0);
+    // TEMP(debug): disabled -- msprof crashes with empty JSON config in CANN 9.0.0
+    msprofEnabled = false;
+
+    // TEMP(debug): skip ACL profiling entirely (CANN 9.0.0 JSON parse crash on launch)
+    isStarted = true;
+    return;
 
     // 2. Initialize ACL Profiling
     const char *envPath = std::getenv("PROTON_ASCEND_OUTPUT_PATH");
